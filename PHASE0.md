@@ -330,6 +330,28 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
   `RIDEV_INPUTSINK` / `RIDEV_EXINPUTSINK` (registrations are logged). The foreground state is cached
   every 10 ms.
 
+## In-game test 9 (2026-10-11): Control's gamepad goes dead
+
+- Clicks no longer leak into Jesse. But the controller stopped working in Control after alt-tab,
+  even back in front and with Resonant closed. Keyboard and mouse still worked. Test 5 showed the same
+  with only passive probes, so it isn't the fake focus.
+- The probe's own XInput sampler saw the pad in Control's process the whole time (except a 1 s
+  `index -1` blip when Resonant started), and the virtual pad was served 300 to 2,000 times/s.
+  Control's input layer ignored both.
+- Cause (input_rmdwin10_f):
+  - `InputManager` holds 4 Gamepad slots (+0x00..+0x18), the selected index at +0x68 and the active id
+    at +0x20.
+  - Each slot's implementation update (input+0x12e0) polls XInput only while connected (+0x19) or
+    while a re-check is requested (+0x18).
+  - One failed read marks the pad disconnected for good, until `refreshGamepadConnectivity` (called by
+    coregame on a device-change notice) sets +0x18.
+  - Steam Input was translating the controller for Control and moves it between Steam games on focus
+    changes, producing exactly such a blip. The tester is turning Steam Input off for Control.
+- Fix (`src/probe_control/gamepad.h`, from `InputManager::update` on the game thread):
+  - set a disconnected pad's re-check flag once a second
+  - with FakeFocus, re-select the last selected gamepad if the selection was cleared
+  - log set/clearSelectedGamepad with callers
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`

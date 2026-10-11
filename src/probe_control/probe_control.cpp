@@ -15,6 +15,7 @@
 #include "../common/bridge.h"
 #include "../common/wwise.h"
 #include "focus.h"
+#include "gamepad.h"
 #include "vpad.h"
 
 using namespace cb;
@@ -234,6 +235,7 @@ namespace
 		bridge::Summary();
 		vpad::Summary();
 		focus::Summary();
+		gamepad::Summary();
 	}
 
 	// Phase 1 (passive): Jesse and the camera go to the link every frame.
@@ -313,6 +315,7 @@ namespace
 		HMODULE input = FirstModule({ L"input_rmdwin10_f.dll", L"input_rmdwin7_f.dll" });
 		Hook(Export(input, "?setFocus@InputManager@input@@QEAAX_N@Z"), reinterpret_cast<void*>(&InputFocusDetour),
 			reinterpret_cast<void**>(&g_inputFocusOrig), "InputManager::setFocus");
+		gamepad::Install(input);
 		if (snd) wwise::Install(snd);
 		wwise::views::g_mod = rl;  // m::PerspectiveView lives in rl_*.dll
 
