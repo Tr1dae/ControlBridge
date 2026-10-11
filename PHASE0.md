@@ -407,6 +407,23 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
   the original. Dylan's entity is found by scanning the entity table for the transform nearest the
   tracked controller; the candidates are logged as doubles and floats.
 
+## In-game test 14 (2026-10-11): Resonant froze (1 frame / 30 s)
+
+- Cause: puppet v3 scanned the whole entity table on the game thread every 2 s while Dylan wasn't
+  found: 283,136 entries, a VirtualQuery and a game lookup per entity.
+- The scan's log revealed the transform layout: **32 bytes = float quaternion (x, y, z, w) + float
+  position + 4 bytes**, world space (e.g. rot 0 0 0 1, pos -395.3 -3.3 301.3). It was being read as
+  doubles, so Dylan never matched.
+- Fix (v3.1):
+  - The scan runs on the probe's worker thread, at most every 10 s while Dylan is unknown, and copies
+    the table once.
+  - Lookups are re-implemented with guarded reads (entity table -> archetype -> column (linear hash
+    search, as exe+32ced90) -> chunk + offset + row*size): the game's lookup (exe+1a480b0) fatal-errors
+    on a free slot.
+  - Matching and writing use the float position at +16, keeping the rotation.
+  - The 30 Hz path only checks that the found entity still follows Dylan's controller (else it
+    rescans) and teleports while puppet mode is on.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
