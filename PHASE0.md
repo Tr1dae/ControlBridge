@@ -352,6 +352,19 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
   - with FakeFocus, re-select the last selected gamepad if the selection was cleared
   - log set/clearSelectedGamepad with callers
 
+## In-game test 10 (2026-10-11): **Jesse played from Resonant** (Phase 1 input milestone)
+
+- Steam Input turned off for Control (Steam > Control > Properties > Controller). Control reads the
+  Xbox pad natively; slot 0 stayed connected all session, and Control selected it itself
+  (`setSelectedGamepad(0)` from exe+544065).
+- One controller drives both games: Dylan in front, and Jesse in the background through the virtual pad.
+  Alt-tab focus-lost events are swallowed and gained ones pass; no pause, no stray clicks, the
+  controller works again after alt-tabbing back.
+- Performance: Resonant unaffected; Control drops to a median 27 fps (0 to 96) while Resonant is in
+  front (both on one RTX 4090). Options for later: lower Control's resolution/settings (it only has to
+  render Jesse), cap Resonant's frame rate, or raise Control's GPU scheduling priority.
+- The gamepad keeper's re-checks hit only the 3 empty slots (about 3 XInput polls/s).
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
