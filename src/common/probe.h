@@ -368,6 +368,84 @@ namespace cb
 		}
 	}
 
+	// ---- value search + watches ---------------------------------------------------------------------------
+	// Finds where a known position lives in memory: heap scan for three consecutive doubles (or
+	// floats) within a_tol of a_xyz. Re-reading the candidates after the player has moved ('cands',
+	// 'keep moved') separates the live transform from stale copies; 'watch' then streams an address
+	// into the CSV (w0..w11).
+	struct Cand
+	{
+		uintptr_t addr;
+		bool      dbl;
+		double    first[3];
+	};
+	inline std::vector<Cand> g_cands;
+
+	inline bool ReadTriple(uintptr_t a_addr, bool a_dbl, double* a_out)
+	{
+		if (a_dbl) return SafeRead(a_out, a_addr, 24);
+		float f[3];
+		if (!SafeRead(f, a_addr, 12)) return false;
+		for (int i = 0; i < 3; ++i) a_out[i] = f[i];
+		return true;
+	}
+
+	inline std::vector<Cand> FindTriple(const double* a_xyz, double a_tol, bool a_dbl, size_t a_max)
+	{
+		std::vector<Cand>    out;
+		std::vector<uint8_t> chunk(1 << 20);
+		const size_t         stride = a_dbl ? 8 : 4, span = 3 * stride;
+		ULONG_PTR            stackLo = 0, stackHi = 0;
+		GetCurrentThreadStackLimits(&stackLo, &stackHi);
+		ForEachHeapRegion([&](uintptr_t a_base, size_t a_size) {
+			if (a_base >= stackLo && a_base < stackHi) return;
+			for (size_t off = 0; off < a_size && out.size() < a_max; off += chunk.size() - span) {
+				size_t n = std::min(chunk.size(), a_size - off);
+				if (n < span || !SafeCopy(chunk.data(), reinterpret_cast<const void*>(a_base + off), n)) continue;
+				const uint8_t* b = chunk.data();
+				for (size_t i = 0; i + span <= n && out.size() < a_max; i += stride) {
+					double v[3];
+					if (a_dbl) {
+						memcpy(v, b + i, 24);
+					} else {
+						float f[3];
+						memcpy(f, b + i, 12);
+						v[0] = f[0], v[1] = f[1], v[2] = f[2];
+					}
+					if (std::fabs(v[0] - a_xyz[0]) > a_tol || std::fabs(v[1] - a_xyz[1]) > a_tol || std::fabs(v[2] - a_xyz[2]) > a_tol) continue;
+					uintptr_t at = a_base + off + i;
+					if (at >= reinterpret_cast<uintptr_t>(chunk.data()) && at < reinterpret_cast<uintptr_t>(chunk.data()) + chunk.size()) continue;
+					out.push_back({ at, a_dbl, { v[0], v[1], v[2] } });
+				}
+				if (n < chunk.size()) break;
+			}
+			Sleep(0);
+		});
+		return out;
+	}
+
+	inline void FindAndLog(const double* a_xyz, double a_tol, size_t a_max)
+	{
+		double t0 = Now();
+		g_cands = FindTriple(a_xyz, a_tol, true, a_max);
+		size_t nd = g_cands.size();
+		auto   f = FindTriple(a_xyz, a_tol, false, a_max);
+		g_cands.insert(g_cands.end(), f.begin(), f.end());
+		Log("find %.3f %.3f %.3f tol %g: %zu as doubles, %zu as floats (%.1f s)", a_xyz[0], a_xyz[1], a_xyz[2], a_tol, nd, f.size(), Now() - t0);
+		for (size_t i = 0; i < g_cands.size() && i < 64; ++i) {
+			auto& c = g_cands[i];
+			Log("  [%zu] %p %s %.4f %.4f %.4f", i, reinterpret_cast<void*>(c.addr), c.dbl ? "d" : "f", c.first[0], c.first[1], c.first[2]);
+		}
+	}
+
+	struct Watch
+	{
+		uintptr_t addr;
+		bool      dbl;
+	};
+	inline Watch   g_watch[4] = {};
+	inline SRWLOCK g_watchLock = SRWLOCK_INIT;
+
 	// ---- pad + keyboard sampler -------------------------------------------------------------------------
 	struct PadSnap
 	{
@@ -465,6 +543,7 @@ namespace cb
 		float    lisFront[3], lisTop[3];
 		uint64_t emitterId;
 		double   emitterPos[3];
+		double   watch[12];  // 4 watched triples ('watch' command), zero when unset/unreadable
 		PadSnap  pad;
 	};
 
@@ -493,6 +572,13 @@ namespace cb
 		a_r.tid = GetCurrentThreadId();
 		a_r.flags = a_extraFlags;
 		a_r.pad = Pad();
+		Watch w[4];
+		AcquireSRWLockShared(&g_watchLock);
+		memcpy(w, g_watch, sizeof(w));
+		ReleaseSRWLockShared(&g_watchLock);
+		for (int i = 0; i < 4; ++i) {
+			if (w[i].addr) ReadTriple(w[i].addr, w[i].dbl, a_r.watch + 3 * i);
+		}
 		if (g_game.fillCommon) g_game.fillCommon(a_r);
 		if (g_game.fill) g_game.fill(a_r);
 	}
@@ -533,8 +619,9 @@ namespace cb
 		fprintf(g_csv, "t,frame,tid,flags");
 		for (int i = 0; i < 16; ++i) fprintf(g_csv, ",p%d", i);
 		for (int i = 0; i < 12; ++i) fprintf(g_csv, ",c%d", i);
-		fprintf(g_csv, ",fov,lis_x,lis_y,lis_z,lis_fx,lis_fy,lis_fz,lis_tx,lis_ty,lis_tz,emi_id,emi_x,emi_y,emi_z,"
-					   "pad,buttons,lt,rt,lx,ly,rx,ry,keys,fg\n");
+		fprintf(g_csv, ",fov,lis_x,lis_y,lis_z,lis_fx,lis_fy,lis_fz,lis_tx,lis_ty,lis_tz,emi_id,emi_x,emi_y,emi_z");
+		for (int i = 0; i < 12; ++i) fprintf(g_csv, ",w%d", i);
+		fprintf(g_csv, ",pad,buttons,lt,rt,lx,ly,rx,ry,keys,fg\n");
 		g_csvStart = Now();
 		g_csvRows = 0;
 		Log("csv: %ls (every %d frame(s), limit %.0f min)", name, g_csvEvery, g_csvLimit / 60.0);
@@ -549,6 +636,7 @@ namespace cb
 		fprintf(f, ",%.6g,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%llu,%.4f,%.4f,%.4f", r.fov, r.lisPos[0], r.lisPos[1], r.lisPos[2],
 			r.lisFront[0], r.lisFront[1], r.lisFront[2], r.lisTop[0], r.lisTop[1], r.lisTop[2],
 			static_cast<unsigned long long>(r.emitterId), r.emitterPos[0], r.emitterPos[1], r.emitterPos[2]);
+		for (double v : r.watch) fprintf(f, ",%.4f", v);
 		fprintf(f, ",%d,%04x,%u,%u,%d,%d,%d,%d,%05x,%u\n", r.pad.index, r.pad.buttons, r.pad.lt, r.pad.rt, r.pad.lx, r.pad.ly, r.pad.rx,
 			r.pad.ry, r.pad.keys, r.pad.fg);
 	}
@@ -631,6 +719,46 @@ namespace cb
 			if (!_stricmp(argv[1], "new")) OpenCsv();
 			g_csvOn = _stricmp(argv[1], "off") != 0;
 			Log("csv %s", g_csvOn.load() ? "on" : "off");
+		} else if (!_stricmp(c, "find") && argc > 3) {  // find <x> <y> <z> [tol] [max]
+			double xyz[3] = { atof(argv[1]), atof(argv[2]), atof(argv[3]) };
+			FindAndLog(xyz, argc > 4 ? atof(argv[4]) : 0.05, argc > 5 ? strtoull(argv[5], nullptr, 10) : 4096);
+		} else if (!_stricmp(c, "cands") || !_stricmp(c, "keep")) {
+			// cands: re-read every candidate. keep moved|static: drop the others (moved = changed by > 1 cm
+			// since it was found; do it after the player has moved).
+			std::vector<Cand> kept;
+			for (size_t i = 0; i < g_cands.size(); ++i) {
+				auto&  k = g_cands[i];
+				double v[3];
+				bool   ok = ReadTriple(k.addr, k.dbl, v);
+				double d = ok ? std::sqrt((v[0] - k.first[0]) * (v[0] - k.first[0]) + (v[1] - k.first[1]) * (v[1] - k.first[1]) +
+									  (v[2] - k.first[2]) * (v[2] - k.first[2]))
+				              : -1;
+				bool   moved = ok && d > 0.01;
+				if (!_stricmp(c, "cands") && i < 64) {
+					Log("  [%zu] %p %s %s now %.4f %.4f %.4f  moved %.3f", i, reinterpret_cast<void*>(k.addr), k.dbl ? "d" : "f",
+						ok ? "" : "UNREADABLE", ok ? v[0] : 0, ok ? v[1] : 0, ok ? v[2] : 0, d);
+				}
+				if (argc > 1 && ok && ((!_stricmp(argv[1], "moved") && moved) || (!_stricmp(argv[1], "static") && !moved))) kept.push_back(k);
+			}
+			if (!_stricmp(c, "keep") && argc > 1) {
+				Log("keep %s: %zu of %zu candidates", argv[1], kept.size(), g_cands.size());
+				g_cands = kept;
+			}
+		} else if (!_stricmp(c, "watch") && argc > 2) {  // watch <slot 0-3> <cand index | addr> [d|f]
+			int       slot = std::clamp(atoi(argv[1]), 0, 3);
+			size_t    idx = strtoull(argv[2], nullptr, 10);
+			bool      isIdx = strlen(argv[2]) < 6 && idx < g_cands.size();
+			Watch     w{ isIdx ? g_cands[idx].addr : ParseAddr(argv[2]), isIdx ? g_cands[idx].dbl : !(argc > 3 && !_stricmp(argv[3], "f")) };
+			AcquireSRWLockExclusive(&g_watchLock);
+			g_watch[slot] = w;
+			ReleaseSRWLockExclusive(&g_watchLock);
+			Log("watch %d = %p (%s) -> csv w%d..w%d", slot, reinterpret_cast<void*>(w.addr), w.dbl ? "doubles" : "floats", slot * 3, slot * 3 + 2);
+		} else if (!_stricmp(c, "unwatch")) {
+			AcquireSRWLockExclusive(&g_watchLock);
+			if (argc > 1) g_watch[std::clamp(atoi(argv[1]), 0, 3)] = {};
+			else memset(g_watch, 0, sizeof(g_watch));
+			ReleaseSRWLockExclusive(&g_watchLock);
+			Log("unwatch %s", argc > 1 ? argv[1] : "all");
 		} else if (!_stricmp(c, "frames")) {
 			Log("frames: %llu ticks, last %.2f s ago, csv %s, %llu rows written", static_cast<unsigned long long>(g_frame.load()),
 				g_lastTick.load() < 0 ? -1.0 : Now() - g_lastTick.load(), g_csvOn.load() ? "on" : "off", g_csvRows);

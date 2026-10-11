@@ -176,7 +176,32 @@ int main()
 	CHECK((r.flags & kRowCam) && r.cam[9] == 100 && std::abs(r.fov - 1.2f) < 1e-6);
 	SummaryCommon();
 
+	// ---- value search: find a heap position, move it, keep the mover, watch it ----
+	auto*  posd = new double[3]{ 1234.5, -77.25, 9.0 };
+	auto*  posf = new float[3]{ 1234.5f, -77.25f, 9.0f };
+	double q[3] = { 1234.5, -77.25, 9.0 };
+	auto   fd_ = FindTriple(q, 0.01, true, 4096);
+	auto   ff_ = FindTriple(q, 0.01, false, 4096);
+	CHECK(std::any_of(fd_.begin(), fd_.end(), [&](const Cand& c) { return c.addr == reinterpret_cast<uintptr_t>(posd); }));
+	CHECK(std::any_of(ff_.begin(), ff_.end(), [&](const Cand& c) { return c.addr == reinterpret_cast<uintptr_t>(posf); }));
+	if (FILE* f = _wfopen(Path(L"selftest_cmd.txt").c_str(), L"w")) {
+		fputs("find 1234.5 -77.25 9 0.01\n", f);
+		fclose(f);
+	}
+	PollCommands();
+	posd[0] += 2.0;  // the "player" moves; copies of the old value don't
+	if (FILE* f = _wfopen(Path(L"selftest_cmd.txt").c_str(), L"w")) {
+		fputs("keep moved\nwatch 1 0\ncands\n", f);
+		fclose(f);
+	}
+	PollCommands();
+	CHECK(g_cands.size() == 1 && g_cands[0].addr == reinterpret_cast<uintptr_t>(posd));
+	Row rw{};
+	FillRow(rw, 0);
+	CHECK(rw.watch[3] == 1236.5 && rw.watch[4] == -77.25 && rw.watch[0] == 0);
+
 	std::string log = ReadAll(Path(L"selftest_probe.log"));
+	CHECK(log.find("keep moved: 1 of") != std::string::npos);
 	CHECK(log.find("rtti") != std::string::npos && log.find("'PerspectiveView@m'") != std::string::npos);
 	CHECK(log.find("listener pos as doubles at +b8") != std::string::npos);  // 0x70 + 9*8
 	CHECK(log.find("unknown command") != std::string::npos);

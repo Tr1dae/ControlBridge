@@ -422,6 +422,22 @@ namespace cb::wwise
 		} else if (!_stricmp(c, "track") && argc > 1) {  // track <id> | auto | off
 			g_tracked = !_stricmp(argv[1], "auto") ? kAuto : !_stricmp(argv[1], "off") ? 0 : strtoull(argv[1], nullptr, 10);
 			Log("tracking emitter %s", argv[1]);
+		} else if (!_stricmp(c, "findnear")) {  // findnear [emitter|listener|<id>] [tol]: 'find' at a Wwise object's position
+			uint64_t id = ListenerId();
+			if (argc > 1 && !_stricmp(argv[1], "emitter")) {
+				Xf lis;
+				auto n = Get(ListenerId(), lis) ? Nearest(lis.pos, 1, 0.5) : std::vector<Near>{};
+				id = g_tracked.load() != kAuto && g_tracked.load() ? g_tracked.load() : (n.empty() ? 0 : n[0].id);
+			} else if (argc > 1 && _stricmp(argv[1], "listener")) {
+				id = strtoull(argv[1], nullptr, 10);
+			}
+			Xf x;
+			if (!id || !Get(id, x)) {
+				Log("findnear: object %llu unknown", static_cast<unsigned long long>(id));
+				return true;
+			}
+			Log("findnear: object %llu", static_cast<unsigned long long>(id));
+			FindAndLog(x.pos, argc > 2 ? atof(argv[2]) : 0.05, 4096);
 		} else if (!_stricmp(c, "views")) {  // views [max]
 			views::Find(argc > 1 ? strtoull(argv[1], nullptr, 10) : 32);
 		} else if (!_stricmp(c, "view") && argc > 1) {  // view <addr>|off [matOff] [fovOff]
