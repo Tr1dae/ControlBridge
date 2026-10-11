@@ -15,16 +15,27 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 for %%d in (bin bin\control bin\resonant obj obj\minhook obj\control obj\resonant obj\selftest) do if not exist %%d mkdir %%d
 set CL_COMMON=/nologo /O2 /MT /W3 /Zi /D_CRT_SECURE_NO_WARNINGS /Ithird_party\minhook\include
 set CXX=%CL_COMMON% /EHsc /std:c++20 /permissive-
+rem start /wait /b does not pass the exit code on: each step is checked by its output file instead
 set RUN=start "" /low /affinity 1 /wait /b
 
-%RUN% cl %CL_COMMON% /c third_party\minhook\src\buffer.c third_party\minhook\src\hook.c third_party\minhook\src\trampoline.c third_party\minhook\src\hde\hde64.c /Foobj\minhook\ /Fdobj\minhook\ || goto fail
+if exist obj\minhook\hde64.obj del /q obj\minhook\*.obj
+%RUN% cl %CL_COMMON% /c third_party\minhook\src\buffer.c third_party\minhook\src\hook.c third_party\minhook\src\trampoline.c third_party\minhook\src\hde\hde64.c /Foobj\minhook\ /Fdobj\minhook\
+if not exist obj\minhook\hde64.obj goto fail
 set MH=obj\minhook\buffer.obj obj\minhook\hook.obj obj\minhook\trampoline.obj obj\minhook\hde64.obj
 
-%RUN% cl %CXX% /LD src\probe_control\probe_control.cpp %MH% /Foobj\control\ /Fdobj\control\ /Febin\control\winmm.dll /link /DEBUG /OPT:REF psapi.lib user32.lib || goto fail
-%RUN% cl %CXX% /LD src\probe_resonant\probe_resonant.cpp %MH% /Foobj\resonant\ /Fdobj\resonant\ /Febin\resonant\cb_probe_resonant.dll /link /DEBUG /OPT:REF psapi.lib user32.lib || goto fail
-%RUN% cl %CXX% tests\selftest.cpp %MH% /Foobj\selftest\ /Fdobj\selftest\ /Febin\selftest.exe /link /DEBUG psapi.lib user32.lib || goto fail
+if exist bin\control\winmm.dll del bin\control\winmm.dll
+%RUN% cl %CXX% /LD src\probe_control\probe_control.cpp %MH% /Foobj\control\ /Fdobj\control\ /Febin\control\winmm.dll /link /DEBUG /OPT:REF psapi.lib user32.lib
+if not exist bin\control\winmm.dll goto fail
+if exist bin\resonant\cb_probe_resonant.dll del bin\resonant\cb_probe_resonant.dll
+%RUN% cl %CXX% /LD src\probe_resonant\probe_resonant.cpp %MH% /Foobj\resonant\ /Fdobj\resonant\ /Febin\resonant\cb_probe_resonant.dll /link /DEBUG /OPT:REF psapi.lib user32.lib
+if not exist bin\resonant\cb_probe_resonant.dll goto fail
+if exist bin\selftest.exe del bin\selftest.exe
+%RUN% cl %CXX% tests\selftest.cpp %MH% /Foobj\selftest\ /Fdobj\selftest\ /Febin\selftest.exe /link /DEBUG psapi.lib user32.lib
+if not exist bin\selftest.exe goto fail
 if not exist obj\linktest mkdir obj\linktest
-%RUN% cl %CXX% tests\link_test.cpp /Foobj\linktest\ /Fdobj\linktest\ /Febin\link_test.exe /link /DEBUG || goto fail
+if exist bin\link_test.exe del bin\link_test.exe
+%RUN% cl %CXX% tests\link_test.cpp /Foobj\linktest\ /Fdobj\linktest\ /Febin\link_test.exe /link /DEBUG
+if not exist bin\link_test.exe goto fail
 echo BUILD OK
 exit /b 0
 :fail

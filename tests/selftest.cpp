@@ -63,6 +63,12 @@ namespace
 		return a_flags;
 	}
 
+	extern "C" __declspec(noinline) uintptr_t FakeSystem(uintptr_t a_world, uintptr_t a_b)
+	{
+		g_sink = g_sink + a_world * 3 + a_b;
+		return a_world + a_b;
+	}
+
 	std::string ReadAll(const std::wstring& a_path)
 	{
 		FILE* f = _wfsopen(a_path.c_str(), L"rb", _SH_DENYNO);
@@ -200,7 +206,26 @@ int main()
 	FillRow(rw, 0);
 	CHECK(rw.watch[3] == 1236.5 && rw.watch[4] == -77.25 && rw.watch[0] == 0);
 
+	// ---- obs: on-demand pass-through hook, then removed again ----
+	snprintf(cmd, sizeof(cmd), "obs 2 %p fake_system\n", reinterpret_cast<void*>(&FakeSystem));
+	if (FILE* f = _wfopen(Path(L"selftest_cmd.txt").c_str(), L"w")) {
+		fputs(cmd, f);
+		fclose(f);
+	}
+	PollCommands();
+	CHECK(g_obs[2].target == reinterpret_cast<void*>(&FakeSystem));
+	for (uintptr_t i = 0; i < 3; ++i) CHECK(FakeSystem(0x1000 + i, 5) == 0x1005 + i);
+	CHECK(g_obs[2].calls.load() == 3 && g_obs[2].args[0].load() == 0x1002 && g_obs[2].args[1].load() == 5);
+	if (FILE* f = _wfopen(Path(L"selftest_cmd.txt").c_str(), L"w")) {
+		fputs("obs\nobs 2 off\n", f);
+		fclose(f);
+	}
+	PollCommands();
+	CHECK(g_obs[2].target == nullptr);
+	CHECK(FakeSystem(1, 1) == 2 && g_obs[2].calls.load() == 3);  // unhooked: still works, no longer counted
+
 	std::string log = ReadAll(Path(L"selftest_probe.log"));
+	CHECK(log.find("obs 2 fake_system") != std::string::npos);
 	CHECK(log.find("keep moved: 1 of") != std::string::npos);
 	CHECK(log.find("rtti") != std::string::npos && log.find("'PerspectiveView@m'") != std::string::npos);
 	CHECK(log.find("listener pos as doubles at +b8") != std::string::npos);  // 0x70 + 9*8

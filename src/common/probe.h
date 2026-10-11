@@ -255,6 +255,68 @@ namespace cb
 		return true;
 	}
 
+	inline bool Unhook(void* a_target)
+	{
+		MH_STATUS s = MH_DisableHook(a_target);
+		if (s == MH_OK) s = MH_RemoveHook(a_target);
+		if (s == MH_OK) g_hooked.erase(std::remove(g_hooked.begin(), g_hooked.end(), a_target), g_hooked.end());
+		Log("unhook %s: %s", Rva(reinterpret_cast<uintptr_t>(a_target)).c_str(), MH_StatusToString(s));
+		return s == MH_OK;
+	}
+
+	// ---- on-demand observer hooks ('obs' command) ------------------------------------------------------
+	// Pass-through hooks on any function (e.g. an ECS system's run thunk): call count, last four
+	// integer arguments, calling thread. For functions with integer/pointer arguments only: the
+	// detour doesn't preserve float argument registers on purpose.
+	struct ObsSlot
+	{
+		void*                  target;
+		char                   name[64];
+		std::atomic<uint64_t>  calls;
+		uint64_t               mark;
+		std::atomic<uintptr_t> args[4];
+		std::atomic<uint32_t>  tid;
+	};
+	inline constexpr int kObs = 8;
+	inline ObsSlot       g_obs[kObs];
+	using ObsFn = uintptr_t (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+	inline ObsFn g_obsOrig[kObs] = {};
+
+	template <int N>
+	uintptr_t ObsDetour(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f)
+	{
+		ObsSlot& s = g_obs[N];
+		s.calls.fetch_add(1, std::memory_order_relaxed);
+		s.args[0].store(a, std::memory_order_relaxed);
+		s.args[1].store(b, std::memory_order_relaxed);
+		s.args[2].store(c, std::memory_order_relaxed);
+		s.args[3].store(d, std::memory_order_relaxed);
+		s.tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+		return g_obsOrig[N](a, b, c, d, e, f);
+	}
+
+	inline void* const kObsDetours[kObs] = { reinterpret_cast<void*>(&ObsDetour<0>), reinterpret_cast<void*>(&ObsDetour<1>),
+		reinterpret_cast<void*>(&ObsDetour<2>), reinterpret_cast<void*>(&ObsDetour<3>), reinterpret_cast<void*>(&ObsDetour<4>),
+		reinterpret_cast<void*>(&ObsDetour<5>), reinterpret_cast<void*>(&ObsDetour<6>), reinterpret_cast<void*>(&ObsDetour<7>) };
+
+	inline void LogObs(bool a_onlyActive)
+	{
+		static double s_last = 0;
+		double        now = Now(), dt = s_last ? std::max(1e-3, now - s_last) : 0;
+		s_last = now;
+		for (int i = 0; i < kObs; ++i) {
+			ObsSlot& s = g_obs[i];
+			if (!s.target) continue;
+			uint64_t c = s.calls.load();
+			if (!a_onlyActive || c != s.mark) {
+				Log("obs %d %-40s %s: %llu calls (%.1f/s) thread %u args %p %p %p %p", i, s.name, Rva(reinterpret_cast<uintptr_t>(s.target)).c_str(),
+					static_cast<unsigned long long>(c), dt ? (c - s.mark) / dt : 0.0, s.tid.load(), reinterpret_cast<void*>(s.args[0].load()),
+					reinterpret_cast<void*>(s.args[1].load()), reinterpret_cast<void*>(s.args[2].load()), reinterpret_cast<void*>(s.args[3].load()));
+			}
+			s.mark = c;
+		}
+	}
+
 	// ---- RTTI ------------------------------------------------------------------------------------------
 	// MSVC x64: vtable[-1] -> CompleteObjectLocator {u32 sig=1, u32 offset, u32 cdOffset,
 	// i32 typeDescRva, i32 hierarchyRva, i32 selfRva}; TypeDescriptor {vtable*, spare, char name[]}.
@@ -759,6 +821,20 @@ namespace cb
 			else memset(g_watch, 0, sizeof(g_watch));
 			ReleaseSRWLockExclusive(&g_watchLock);
 			Log("unwatch %s", argc > 1 ? argv[1] : "all");
+		} else if (!_stricmp(c, "obs") && argc > 2) {  // obs <slot 0-7> <addr|off> [name]
+			int slot = std::clamp(atoi(argv[1]), 0, kObs - 1);
+			if (g_obs[slot].target) Unhook(g_obs[slot].target);
+			g_obs[slot].target = nullptr;
+			if (_stricmp(argv[2], "off") != 0) {
+				void* t = reinterpret_cast<void*>(ParseAddr(argv[2]));
+				ObsSlot& s = g_obs[slot];
+				s.calls = 0;
+				s.mark = 0;
+				strncpy_s(s.name, argc > 3 ? argv[3] : argv[2], _TRUNCATE);
+				if (t && Readable(reinterpret_cast<uintptr_t>(t), 16) && Hook(t, kObsDetours[slot], reinterpret_cast<void**>(&g_obsOrig[slot]), s.name)) s.target = t;
+			}
+		} else if (!_stricmp(c, "obs")) {
+			LogObs(false);
 		} else if (!_stricmp(c, "frames")) {
 			Log("frames: %llu ticks, last %.2f s ago, csv %s, %llu rows written", static_cast<unsigned long long>(g_frame.load()),
 				g_lastTick.load() < 0 ? -1.0 : Now() - g_lastTick.load(), g_csvOn.load() ? "on" : "off", g_csvRows);
@@ -829,6 +905,7 @@ namespace cb
 				Log("--- %llu frames, last tick %.2f s ago; pad %d btn %04x LT %u RT %u L(%d,%d) R(%d,%d) keys %05x fg %u",
 					static_cast<unsigned long long>(g_frame.load()), g_lastTick.load() < 0 ? -1.0 : now - g_lastTick.load(), p.index,
 					p.buttons, p.lt, p.rt, p.lx, p.ly, p.rx, p.ry, p.keys, p.fg);
+				LogObs(true);
 				if (g_game.summaryCommon) g_game.summaryCommon();
 				if (g_game.summary) g_game.summary();
 			}
