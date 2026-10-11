@@ -1,8 +1,11 @@
-// Phase 1b: Dylan follows Jesse. When puppet mode is on, Dylan's character controller position is
-// written from inside coregame::charactercontroller::applyControllerToTransform (the 30 Hz ECS
-// system that copies the controller into the entity transform; run thunk from
-// tools/ecs_systems.py), just before the original runs. The transform then takes the written
-// position and the next controller step starts from it.
+// Phase 1b: Dylan follows Jesse. applyControllerToTransform (30 Hz ECS system, run thunk
+// exe+1bc6500) calls a per-entity function (exe+1bc08f0, ctx in rcx) that reads the controller's
+// position through ctx: idx = [ctx+0x50]; ctrl = [[ctx+8] + idx*32 + 8]; pos = [ctrl+0x10] (32
+// bytes, doubles), and hands it to the transform setter (exe+1836800; exe+1836ad0 on the flagged
+// "teleported" branch). Test 11: writing the ControllerHitReport+0x38 copy did nothing visible, so
+// the puppet now writes into [ctrl+0x10] for Dylan's entity, just before the per-entity function
+// runs. Dylan's entity is recognised the first time its [ctrl+0x10] position matches the tracked
+// controller (player.h).
 //
 // Mapping, fixed when puppet mode starts (or on re-anchor): both games are left-handed, Y up,
 // metres (test 1), so
@@ -11,8 +14,8 @@
 // direction in both views. Jesse falling more than 50 m below the anchor stops the follow (Resonant
 // autosaves; never leave Dylan under the map).
 //
-// Hotkeys while Resonant is in front: F7 puppet on/off, F8 back to where puppet mode started,
-// F9 re-anchor. Commands (resonant_cmd.txt): puppet on|off, home, anchor, pos, tp <dx> <dy> <dz>,
+// Hotkeys while Resonant is in front (keys games rarely bind; something reacted to F7 in test 11):
+// Insert puppet on/off, Home back to where puppet mode started, Page Up re-anchor. Commands (resonant_cmd.txt): puppet on|off, home, anchor, pos, tp <dx> <dy> <dz>,
 // tpabs <x> <y> <z>.
 #pragma once
 
@@ -40,6 +43,8 @@ namespace cb::puppet
 	inline double g_tp[3];
 
 	inline std::atomic<uint64_t> g_calls{ 0 }, g_writes{ 0 }, g_mismatch{ 0 }, g_refused{ 0 };
+	inline std::atomic<uintptr_t> g_ctrl{ 0 }, g_ctrlFor{ 0 };
+	inline double                 g_yOff = 0;  // [ctrl+0x10] height above the hit-report copy  // Dylan's controller object, and the tracked hit report it belongs to
 	inline double                g_lastTarget[3] = {};
 
 	inline double Yaw(const float* a_fwd) { return std::atan2(a_fwd[0], a_fwd[2]); }  // 0 = +Z
@@ -103,65 +108,93 @@ namespace cb::puppet
 		ReleaseSRWLockExclusive(&g_lock);
 	}
 
-	inline void WritePos(uintptr_t a_obj, const double* a_p)
+	inline void WriteRaw(uintptr_t a_at, const double* a_p)
 	{
 		__try {
-			memcpy(reinterpret_cast<void*>(a_obj + player::kPosOff), a_p, 24);
-			memcpy(reinterpret_cast<void*>(a_obj + player::kPrevOff), a_p, 24);
+			memcpy(reinterpret_cast<void*>(a_at), a_p, 24);
 		} __except (EXCEPTION_EXECUTE_HANDLER) {
 		}
 	}
 
-	// The system's run thunk: integer/pointer arguments only (see tools/ecs_systems.py).
-	inline uintptr_t ApplyDetour(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f)
+	// The position pointer the per-entity function reads, or 0.
+	inline uintptr_t PosPtr(uintptr_t a_ctx, uintptr_t& a_ctrl)
+	{
+		uintptr_t idx = 0, flags = 0, arr = 0, p = 0;
+		uint8_t   skip = 1;
+		if (!Read(a_ctx + 0x50, idx) || !Read(a_ctx, flags) || !Read(flags + idx * 2, skip) || skip) return 0;
+		if (!Read(a_ctx + 8, arr) || !Read(arr + idx * 32 + 8, a_ctrl) || !a_ctrl || !Read(a_ctrl + 0x10, p)) return 0;
+		return p;
+	}
+
+	// Target for this step (caller holds g_lock), false if nothing to write.
+	inline bool TargetLocked(const double* a_cur, double* a_target)
+	{
+		if (g_tpPending) {
+			for (int i = 0; i < 3; ++i) a_target[i] = g_tpRelative ? a_cur[i] + g_tp[i] : g_tp[i];
+			g_tpPending = false;
+			if (g_on && g_anchored) {  // keep following from the new spot
+				memcpy(g_dylan0, a_target, 24);
+				proto::GuestState g;
+				if (Guest(g)) memcpy(g_jesse0, g.jesse.pos, 24);
+			}
+			Log("puppet: teleport to %.2f %.2f %.2f", a_target[0], a_target[1], a_target[2]);
+			return true;
+		}
+		if (!g_on || !g_anchored) return false;
+		proto::GuestState g;
+		if (!Guest(g)) return false;
+		double dx = g.jesse.pos[0] - g_jesse0[0], dy = g.jesse.pos[1] - g_jesse0[1], dz = g.jesse.pos[2] - g_jesse0[2];
+		double c = std::cos(g_theta), s = std::sin(g_theta);
+		a_target[0] = g_dylan0[0] + dx * c + dz * s;
+		a_target[1] = g_dylan0[1] + dy;
+		a_target[2] = g_dylan0[2] - dx * s + dz * c;
+		if (dy < -50.0) {
+			g_refused.fetch_add(1);  // Jesse fell far: don't drag Dylan under the map
+			return false;
+		}
+		return true;
+	}
+
+	// Per-entity body of applyControllerToTransform (pointer arguments only).
+	inline uintptr_t EntityDetour(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f)
 	{
 		g_calls.fetch_add(1, std::memory_order_relaxed);
-		uintptr_t obj = player::g_obj.load();
-		double    cur[3], target[3];
-		bool      write = false;
-		if (obj && player::Pos(obj, cur) && (g_on.load() || g_tpPending)) {
-			AcquireSRWLockExclusive(&g_lock);
-			if (g_tpPending) {
-				for (int i = 0; i < 3; ++i) target[i] = g_tpRelative ? cur[i] + g_tp[i] : g_tp[i];
-				g_tpPending = false;
-				write = true;
-				if (g_on && g_anchored) {  // keep following from the new spot
-					memcpy(g_dylan0, target, 24);
-					proto::GuestState g;
-					if (Guest(g)) memcpy(g_jesse0, g.jesse.pos, 24);
-				}
-				Log("puppet: teleport to %.2f %.2f %.2f", target[0], target[1], target[2]);
-			} else if (g_on && g_anchored) {
-				proto::GuestState g;
-				if (Guest(g)) {
-					double dx = g.jesse.pos[0] - g_jesse0[0], dy = g.jesse.pos[1] - g_jesse0[1], dz = g.jesse.pos[2] - g_jesse0[2];
-					double c = std::cos(g_theta), s = std::sin(g_theta);
-					target[0] = g_dylan0[0] + dx * c + dz * s;
-					target[1] = g_dylan0[1] + dy;
-					target[2] = g_dylan0[2] - dx * s + dz * c;
-					if (dy < -50.0) {
-						g_refused.fetch_add(1);  // Jesse fell far: don't drag Dylan under the map
-					} else {
-						write = true;
-					}
+		uintptr_t ctrl = 0, p = PosPtr(a, ctrl), hit = player::g_obj.load();
+		if (p && hit) {
+			if (g_ctrlFor.load() != hit) {  // (re)identify Dylan's entity
+				// Horizontal match: [ctrl+0x10] may be the capsule centre rather than the feet.
+				double pos[3], want[3];
+				if (SafeRead(pos, p, 24) && player::Pos(hit, want) && std::hypot(pos[0] - want[0], pos[2] - want[2]) < 0.3 &&
+					std::fabs(pos[1] - want[1]) < 2.0) {
+					g_ctrl = ctrl;
+					g_ctrlFor = hit;
+					g_yOff = pos[1] - want[1];
+					Log("puppet: Dylan's entity found: controller %p, position at [ctrl+0x10] = %p (%.3f %.3f %.3f, %+.3f m above the hit-report copy); "
+						"hit report %p = ctrl%+lld, position ptr - hit report %+lld",
+						reinterpret_cast<void*>(ctrl), reinterpret_cast<void*>(p), pos[0], pos[1], pos[2], g_yOff, reinterpret_cast<void*>(hit),
+						static_cast<long long>(hit) - static_cast<long long>(ctrl), static_cast<long long>(p) - static_cast<long long>(hit));
 				}
 			}
-			ReleaseSRWLockExclusive(&g_lock);
-		}
-		if (write) {
-			WritePos(obj, target);
-			memcpy(g_lastTarget, target, 24);
-			g_writes.fetch_add(1, std::memory_order_relaxed);
-		}
-		uintptr_t r = g_applyOrig(a, b, c, d, e, f);
-		if (write) {  // does the game keep what we wrote?
-			double after[3];
-			if (player::Pos(obj, after) && wwise::Dist(after, target) > 0.01 && g_mismatch.fetch_add(1) < 5) {
-				Log("puppet: after the system ran, controller at %.3f %.3f %.3f (wrote %.3f %.3f %.3f)", after[0], after[1], after[2], target[0], target[1],
-					target[2]);
+			if (ctrl == g_ctrl.load() && (g_on.load() || g_tpPending)) {
+				double cur[3], target[3];
+				bool   write = false;
+				if (SafeRead(cur, p, 24)) {
+					cur[1] -= g_yOff;
+					AcquireSRWLockExclusive(&g_lock);
+					write = TargetLocked(cur, target);
+					ReleaseSRWLockExclusive(&g_lock);
+				}
+				if (write) {  // target is in hit-report (feet) space; [ctrl+0x10] sits g_yOff higher
+					double atCtrl[3] = { target[0], target[1] + g_yOff, target[2] };
+					WriteRaw(p, atCtrl);
+					WriteRaw(hit + player::kPosOff, target);
+					WriteRaw(hit + player::kPrevOff, target);
+					memcpy(g_lastTarget, target, 24);
+					g_writes.fetch_add(1, std::memory_order_relaxed);
+				}
 			}
 		}
-		return r;
+		return g_applyOrig(a, b, c, d, e, f);
 	}
 
 	// ---- hotkeys (worker tick) -------------------------------------------------------------------
@@ -172,7 +205,7 @@ namespace cb::puppet
 		DWORD pid = 0;
 		GetWindowThreadProcessId(GetForegroundWindow(), &pid);
 		if (pid != GetCurrentProcessId()) return;
-		const int keys[3] = { VK_F7, VK_F8, VK_F9 };
+		const int keys[3] = { VK_INSERT, VK_HOME, VK_PRIOR };
 		for (int i = 0; i < 3; ++i) {
 			bool down = (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
 			if (down && !g_keyDown[i]) {
@@ -197,9 +230,9 @@ namespace cb::puppet
 	inline void Summary()
 	{
 		if (!g_applyOrig) return;
-		Log("puppet: %s; system runs %llu, writes %llu, kept-mismatch %llu, refused (Jesse fell) %llu; last target %.2f %.2f %.2f",
-			g_on.load() ? "ON" : "off", static_cast<unsigned long long>(g_calls.load()), static_cast<unsigned long long>(g_writes.load()),
-			static_cast<unsigned long long>(g_mismatch.load()), static_cast<unsigned long long>(g_refused.load()), g_lastTarget[0], g_lastTarget[1],
+		Log("puppet: %s; entity calls %llu, Dylan's entity %s, writes %llu, refused (Jesse fell) %llu; last target %.2f %.2f %.2f",
+			g_on.load() ? "ON" : "off", static_cast<unsigned long long>(g_calls.load()), g_ctrl.load() ? "known" : "not yet",
+			static_cast<unsigned long long>(g_writes.load()), static_cast<unsigned long long>(g_refused.load()), g_lastTarget[0], g_lastTarget[1],
 			g_lastTarget[2]);
 	}
 
@@ -228,8 +261,9 @@ namespace cb::puppet
 		return true;
 	}
 
-	inline void Install(void* a_applyThunk)
+	inline void Install(void* a_entityFn)
 	{
-		Hook(a_applyThunk, reinterpret_cast<void*>(&ApplyDetour), reinterpret_cast<void**>(&g_applyOrig), "applyControllerToTransform (puppet)");
+		Hook(a_entityFn, reinterpret_cast<void*>(&EntityDetour), reinterpret_cast<void**>(&g_applyOrig),
+			"applyControllerToTransform per-entity (puppet)");
 	}
 }

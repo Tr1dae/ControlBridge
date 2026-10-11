@@ -365,6 +365,24 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
   render Jesse), cap Resonant's frame rate, or raise Control's GPU scheduling priority.
 - The gamepad keeper's re-checks hit only the 3 empty slots (about 3 XInput polls/s).
 
+## In-game test 11 (2026-10-11): puppet v1 wrote the wrong copy
+
+- The hotkeys worked (the log shows on / teleport / off / anchor), and the written controller field
+  kept its value (0 mismatches), but Dylan didn't visibly move or teleport. The field at
+  `ControllerHitReport + 0x38` is a copy, not what drives the transform.
+- `applyControllerToTransform`'s run thunk (exe+1bc6500) walks ECS chunks and calls a per-entity body
+  (exe+1bc08f0, ctx in rcx):
+  - It skips the entity if `byte [[ctx] + idx*2]` is set (`idx = [ctx+0x50]`).
+  - `ctrl = [[ctx+8] + idx*32 + 8]`; the position is the 32 bytes at `[ctrl+0x10]`.
+  - It hands that position to the transform setter: exe+1836800, or exe+1836ad0 when
+    `byte [[ctx+0x10] + idx*64 + 0x30]` is set (looks like the "teleported" path, which then sets a
+    flag).
+- Puppet v2 hooks the per-entity body. It recognises Dylan's entity by a horizontal match between
+  `[ctrl+0x10]` and the tracked controller (logging the vertical offset and the object relation), then
+  writes the target there before the original runs.
+- Something in Resonant reacted to F7 (the weapon-wheel UI moved). Hotkeys are now Insert (on/off),
+  Home (back to the start), Page Up (re-anchor).
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
