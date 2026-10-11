@@ -10,6 +10,7 @@ using namespace cb::link;
 
 namespace
 {
+	using namespace cb::proto;
 	int g_fail = 0;
 
 #define CHECK(c)                                                    \
@@ -129,10 +130,82 @@ namespace
 		Drain(c.shm->toHostCmd, c.shm->toHostCmdData, [&](uint32_t, const uint8_t* a_p, uint32_t a_n) { got.assign(reinterpret_cast<const char*>(a_p), a_n); });
 		CHECK(got == "tp 0 10 0");
 	}
+#define OFF(T, F) static_cast<unsigned>(offsetof(T, F))
+	void PrintLayout()
+	{
+		using namespace cb::proto;
+		printf("{\"version\":%u,\"size\":%zu,\n", kVersion, sizeof(Shared));
+		printf(" \"header\":{\"off\":%u,\"magic\":%u,\"version\":%u,\"hostPid\":%u,\"guestPid\":%u,\"hostHeartbeatMs\":%u,\"guestHeartbeatMs\":%u},\n",
+			OFF(Shared, header), OFF(Header, magic), OFF(Header, version), OFF(Header, hostPid), OFF(Header, guestPid), OFF(Header, hostHeartbeatMs),
+			OFF(Header, guestHeartbeatMs));
+		printf(" \"slots\":{\"host\":%u,\"pad\":%u,\"guest\":%u,\"data\":%u},\n", OFF(Shared, host), OFF(Shared, pad), OFF(Shared, guest),
+			OFF(Slot<HostState>, data));
+		printf(" \"Xform\":{\"pos\":%u,\"rot\":%u}, \"View\":{\"xf\":%u,\"fovY\":%u,\"aspect\":%u},\n", OFF(Xform, pos), OFF(Xform, rot), OFF(View, xf),
+			OFF(View, fovY), OFF(View, aspect));
+		printf(" \"HostState\":{\"flags\":%u,\"worldId\":%u,\"frame\":%u,\"dt\":%u,\"teleportSeq\":%u,\"teleport\":%u,\"player\":%u,\"camera\":%u},\n",
+			OFF(HostState, flags), OFF(HostState, worldId), OFF(HostState, frame), OFF(HostState, dt), OFF(HostState, teleportSeq),
+			OFF(HostState, teleport), OFF(HostState, player), OFF(HostState, camera));
+		printf(" \"PadState\":{\"flags\":%u,\"packet\":%u,\"buttons\":%u,\"lt\":%u,\"rt\":%u,\"lx\":%u,\"ly\":%u,\"rx\":%u,\"ry\":%u},\n",
+			OFF(PadState, flags), OFF(PadState, packet), OFF(PadState, buttons), OFF(PadState, lt), OFF(PadState, rt), OFF(PadState, lx),
+			OFF(PadState, ly), OFF(PadState, rx), OFF(PadState, ry));
+		printf(" \"GuestState\":{\"flags\":%u,\"teleportAck\":%u,\"frame\":%u,\"qpc\":%u,\"jesse\":%u,\"vel\":%u,\"height\":%u,\"camera\":%u}}\n",
+			OFF(GuestState, flags), OFF(GuestState, teleportAck), OFF(GuestState, frame), OFF(GuestState, qpc), OFF(GuestState, jesse),
+			OFF(GuestState, vel), OFF(GuestState, height), OFF(GuestState, camera));
+	}
+
+	// Writes moving fake host/guest states into a mapping (never the live name) for a_seconds, so
+	// tools/cb_monitor.py can be tested without the games.
+	int Fake(const wchar_t* a_name, int a_seconds)
+	{
+		if (!wcscmp(a_name, kMappingName)) {
+			printf("refusing to fake the live mapping\n");
+			return 1;
+		}
+		Mapping m;
+		if (!m.Open(a_name)) return 1;
+		m.shm->header.hostPid = 111;
+		m.shm->header.guestPid = 222;
+		for (int i = 0; i < a_seconds * 60; ++i) {
+			HostState h{};
+			h.flags = kHostInGame;
+			h.frame = i;
+			h.player.pos[0] = 600 + i * 0.1;
+			h.player.pos[1] = 0.13;
+			h.player.pos[2] = -80;
+			h.camera.xf.pos[0] = 600 + i * 0.1 + 4;
+			h.camera.xf.pos[1] = 2.5;
+			h.camera.xf.rot[6] = -1;  // forward -X
+			h.camera.fovY = 0.97f;
+			Write(m.shm->host, h);
+			PadState p{ kPadActive, static_cast<uint32_t>(i), 0x1000, 0, 255, 0, 32767, 0, 0 };
+			Write(m.shm->pad, p);
+			GuestState g{};
+			g.flags = kGuestInWorld;
+			g.frame = i;
+			g.jesse.pos[0] = -8;
+			g.jesse.pos[1] = -152;
+			g.jesse.pos[2] = -85 + i * 0.07;
+			g.camera.xf.pos[1] = -150;
+			g.camera.fovY = 0.75f;
+			Write(m.shm->guest, g);
+			m.shm->header.hostHeartbeatMs = m.shm->header.guestHeartbeatMs = GetTickCount64();
+			Sleep(16);
+		}
+		return 0;
+	}
 }
 
-int main()
+int main(int argc, char** argv)
 {
+	if (argc > 1 && !strcmp(argv[1], "--layout")) {
+		PrintLayout();
+		return 0;
+	}
+	if (argc > 2 && !strcmp(argv[1], "--fake")) {
+		std::string  n = argv[2];
+		std::wstring w(n.begin(), n.end());
+		return Fake(w.c_str(), argc > 3 ? atoi(argv[3]) : 5);
+	}
 	TestMapping();
 	TestSeqlock();
 	TestRing();

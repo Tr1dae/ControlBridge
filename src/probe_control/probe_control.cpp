@@ -12,6 +12,7 @@
 #include "fwd_winmm.h"
 
 #include "../common/probe.h"
+#include "../common/bridge.h"
 #include "../common/wwise.h"
 
 using namespace cb;
@@ -192,6 +193,28 @@ namespace
 	{
 		LogAvatars();
 		LogCamera();
+		bridge::Summary();
+	}
+
+	// Phase 1 (passive): Jesse and the camera go to the link every frame.
+	void Publish(const Row& a_r)
+	{
+		proto::GuestState g{};
+		g.frame = a_r.frame;
+		LARGE_INTEGER q;
+		QueryPerformanceCounter(&q);
+		g.qpc = q.QuadPart;
+		if (a_r.flags & kRowPlayer) {  // getTransform: rows right, up, forward, then translation
+			double rows[9], pos[3] = { a_r.player[9], a_r.player[10], a_r.player[11] };
+			for (int i = 0; i < 9; ++i) rows[i] = a_r.player[i];
+			bridge::SetXform(g.jesse, pos, rows);
+			g.flags |= proto::kGuestInWorld;
+		}
+		if (a_r.flags & kRowCam) {
+			bridge::SetXform(g.camera.xf, a_r.cam + 9, a_r.cam);
+			g.camera.fovY = a_r.fov;
+		}
+		bridge::PublishGuest(g);
 	}
 
 	bool Command(int argc, char** argv)
@@ -252,6 +275,8 @@ namespace
 		if (snd) wwise::Install(snd);
 		wwise::views::g_mod = rl;  // m::PerspectiveView lives in rl_*.dll
 
+		bridge::Open(false);
+		g_game.publish = Publish;
 		g_game.fill = Fill;
 		g_game.summary = Summary;
 		g_game.command = Command;

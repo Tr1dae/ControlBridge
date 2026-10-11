@@ -730,6 +730,7 @@ namespace cb
 		void (*summaryCommon)() = nullptr;
 		bool (*commandCommon)(int, char**) = nullptr;
 		void (*workerTick)() = nullptr;              // every ~10 ms on the probe thread
+		void (*publish)(const struct Row&) = nullptr;  // every frame, on the frame thread (link)
 	};
 	inline GameHooks g_game;
 
@@ -763,9 +764,12 @@ namespace cb
 	{
 		uint64_t f = g_frame.fetch_add(1) + 1;
 		g_lastTick.store(Now());
-		if (!g_csvOn.load(std::memory_order_relaxed) || f % g_csvEvery) return;
+		bool csv = g_csvOn.load(std::memory_order_relaxed) && f % g_csvEvery == 0;
+		if (!csv && !g_game.publish) return;
 		Row r{};
 		FillRow(r, 0);
+		if (g_game.publish) g_game.publish(r);
+		if (!csv) return;
 		AcquireSRWLockExclusive(&g_rowLock);
 		if (g_rows.size() < 100000) g_rows.push_back(r);
 		ReleaseSRWLockExclusive(&g_rowLock);

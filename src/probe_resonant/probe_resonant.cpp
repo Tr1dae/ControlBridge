@@ -6,15 +6,40 @@
 //     footsteps/voice emitters move with him), found by decorated export name
 //   m::PerspectiveView (RTTI): 'views' finds live camera views and where the listener's position
 //     sits inside them; 'view <addr> [matOff] [fovOff]' streams that view into the CSV
+//   physics::CharacterController (player.h): Dylan's controller position, found by RTTI + heap scan
 //   generic RTTI/memory commands for the next step (the player's transform in the ECS)
 // Commands go to logs\resonant_cmd.txt (see README).
+#include "../common/bridge.h"
 #include "../common/probe.h"
 #include "../common/wwise.h"
+#include "player.h"
 
 using namespace cb;
 
 namespace
 {
+	// Phase 1 (passive): Dylan's controller position, the tracked camera view and the real controller
+	// go to the link every frame.
+	void Publish(const Row& a_r)
+	{
+		static double s_last = 0;
+		proto::HostState h{};
+		h.frame = a_r.frame;
+		h.dt = s_last ? static_cast<float>(a_r.t - s_last) : 0.0f;
+		s_last = a_r.t;
+		double p[3];
+		if (player::Pos(player::g_obj.load(), p)) {
+			const double ident[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };  // controller has no facing; Phase 1 adds it
+			bridge::SetXform(h.player, p, ident);
+			h.flags |= proto::kHostInGame;
+		}
+		if (a_r.flags & kRowCam) {
+			bridge::SetXform(h.camera.xf, a_r.cam + 9, a_r.cam);
+			h.camera.fovY = a_r.fov;
+		}
+		bridge::PublishHost(h, a_r.pad);
+	}
+
 	DWORD WINAPI Worker(void* a_self)
 	{
 		Init(static_cast<HMODULE>(a_self), L"resonant");
@@ -45,6 +70,18 @@ namespace
 		} else {
 			Log("exe build differs from the ECS map (PE timestamp %08lx): system observers off", Nt(exe)->FileHeader.TimeDateStamp);
 		}
+		player::Init(exe);
+		bridge::Open(true);
+		g_game.publish = Publish;
+		g_game.fill = player::Fill;
+		g_game.summary = [] {
+			player::Summary();
+			bridge::Summary();
+		};
+		g_game.workerTick = [] {
+			wwise::autorecon::Tick();
+			player::Tick();
+		};
 		Run();
 		return 0;
 	}

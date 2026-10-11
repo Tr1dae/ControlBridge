@@ -534,7 +534,7 @@ namespace cb::wwise
 	// and 'autofind' on their own, so a test only needs the player to walk and stop twice.
 	namespace autorecon
 	{
-		inline bool   g_on = false, g_done = false;
+		inline bool   g_on = false, g_done = false, g_find = false;  // g_find: also run autofind (AutoFind=1)
 		inline double g_firstSeen = 0, g_still = 0, g_last[3] = {};
 
 		inline void Tick()
@@ -556,10 +556,11 @@ namespace cb::wwise
 			CreateThread(nullptr, 0, [](void*) -> DWORD {
 				// The player snapshot first (it must finish before the player moves; its chime says
 				// "walk now"), then the camera views, which don't mind movement.
-				Log("auto recon: player standing still, snapshotting positions near the player");
+				Log("auto recon: player standing still%s", g_find ? ", snapshotting positions near the player" : "");
 				Xf   l;
 				auto n = Get(ListenerId(), l) ? Nearest(l.pos, 1, 0.5) : std::vector<Near>{};
-				if (n.empty()) {
+				if (!g_find) {
+				} else if (n.empty()) {
 					Log("auto recon: no emitter near the camera, autofind skipped");
 				} else {
 					autofind::Start(n[0].id, 1.0, 2.5);
@@ -723,6 +724,8 @@ namespace cb::wwise
 		g_game.commandCommon = CommandCommon;
 		g_game.workerTick = autorecon::Tick;
 		autorecon::g_on = IniInt(L"AutoRecon", 0) != 0;
-		Log("auto recon %s", autorecon::g_on ? "on: stand still after loading, then walk > 3 m and stop, twice" : "off");
+		autorecon::g_find = IniInt(L"AutoFind", 0) != 0;
+		Log("auto recon %s%s", autorecon::g_on ? "on (camera views once the player stands still)" : "off",
+			autorecon::g_find ? " + autofind: then walk > 3 m and stop, twice" : "");
 	}
 }

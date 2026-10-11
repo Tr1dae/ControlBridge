@@ -213,6 +213,40 @@ an alt-tab. Analysis: `tools/analyze_frames.py` plus the camera-turn check.
   first, then views). The chimes never played because the scan never ended; they now also sound an
   explicit `Beep()` tone.
 
+## In-game test 4 (2026-10-11): Dylan's position and Resonant's camera found
+
+- Scans now take under 1 s: about 4 GB scanned, about 10.6 GB of write-combined GPU memory skipped
+  (Control: 2.3 GB / 6 GB).
+- **Resonant camera:** the `m::PerspectiveView` instance 1.5 m from the listener has sane axes and
+  fovY 55.6 deg (from the view-to-clip that follows view-to-world). Only heap and stack pointers lead
+  to it (no module global found yet), so it is re-found each session with `views` (auto recon, no
+  walking needed).
+- **Dylan = Remedy's `physics::CharacterController`.** The delta-matched double triple sits at
+  `ControllerHitReport + 0x38`:
+  - vtable `exe+4d93290`, RTTI `.?AUControllerHitReport@physics@@`, a member object
+  - a `createSweeper` lambda just before it
+  - a second copy at +0x58 (previous step)
+
+  The values are floats stored as doubles (the low mantissa bits are zero), as in PhysX CCT's
+  `PxExtendedVec3`. The probe now finds the ControllerHitReport vtable by RTTI name, scans its
+  instances and tracks the one nearest the player's emitters (`src/probe_resonant/player.h`).
+- Other movers near Dylan: an AABB plus root pose block (min/max corners about 3.7 m tall, a quaternion,
+  float position), no vtable: render/bounds data.
+- **Control camera** cross-check: the m::PerspectiveView 0.00 m from the listener equals g_pRenderView's
+  position.
+- Control's autofind picked emitter 4294967346 (a camera-relative ambient emitter, not Jesse). Not
+  needed there: Jesse comes from `getTransform`.
+
+## Phase 1 started: passive link
+
+Both probes open `Local\ControlBridge_v1` and publish every frame:
+- Resonant: `HostState` (Dylan's controller position, the tracked camera view) and `PadState` (the
+  real controller while Resonant is in front)
+- Control: `GuestState` (Jesse's transform, the g_pRenderView camera)
+
+`tools/cb_monitor.py` shows both sides live, plus the Dylan - Jesse offset. It uses
+`bin/link_test.exe --layout` for offsets and is tested with `link_test --fake`. Nothing is driven yet.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
