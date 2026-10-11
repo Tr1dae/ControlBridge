@@ -386,7 +386,7 @@ namespace cb::wwise
 			kWaitMove,
 			kWaitStop
 		};
-		inline State             g_state = kIdle;
+		inline std::atomic<State> g_state{ kIdle };
 		inline uint64_t          g_ref = 0;
 		inline double            g_from[3], g_last[3], g_still = 0;
 		inline int               g_round = 0;
@@ -394,7 +394,19 @@ namespace cb::wwise
 
 		// Chimes tell the tester what to do without looking at the log: asterisk = "walk now",
 		// default beep = "round done, walk again", exclamation = "finished".
-		inline void Chime(UINT a_type) { MessageBeep(a_type); }
+		inline void Chime(UINT a_type)
+		{
+			MessageBeep(a_type);
+			// Also an explicit tone (system sounds may be muted): 1, 2 or 3 short beeps, off-thread.
+			int n = a_type == MB_ICONASTERISK ? 1 : a_type == MB_OK ? 2 : 3;
+			CreateThread(nullptr, 0, [](void* a_n) -> DWORD {
+				for (intptr_t i = 0; i < reinterpret_cast<intptr_t>(a_n); ++i) {
+					Beep(1000, 180);
+					Sleep(120);
+				}
+				return 0;
+			}, reinterpret_cast<void*>(static_cast<intptr_t>(n)), 0, nullptr);
+		}
 
 
 		inline bool RefPos(double* a_out)
@@ -540,14 +552,21 @@ namespace cb::wwise
 			}
 			if (now - g_firstSeen < 10.0 || now - g_still < 3.0) return;
 			g_done = true;
-			Log("auto recon: player standing still, searching camera views and the player's position");
-			views::Find(1024);
-			auto n = Nearest(lis.pos, 1, 0.5);
-			if (n.empty()) {
-				Log("auto recon: no emitter near the camera, autofind skipped");
-				return;
-			}
-			autofind::Start(n[0].id, 1.0, 2.5);
+			// Scans run on their own thread so the probe keeps logging and writing the CSV meanwhile.
+			CreateThread(nullptr, 0, [](void*) -> DWORD {
+				// The player snapshot first (it must finish before the player moves; its chime says
+				// "walk now"), then the camera views, which don't mind movement.
+				Log("auto recon: player standing still, snapshotting positions near the player");
+				Xf   l;
+				auto n = Get(ListenerId(), l) ? Nearest(l.pos, 1, 0.5) : std::vector<Near>{};
+				if (n.empty()) {
+					Log("auto recon: no emitter near the camera, autofind skipped");
+				} else {
+					autofind::Start(n[0].id, 1.0, 2.5);
+				}
+				views::Find(1024);
+				return 0;
+			}, nullptr, 0, nullptr);
 		}
 	}
 

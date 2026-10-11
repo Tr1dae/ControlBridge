@@ -122,6 +122,20 @@ int main()
 	}
 	CHECK(FindVtables(GetModuleHandleW(nullptr), "NoSuchClass@zz").empty());
 
+	// Write-combined memory (GPU upload heaps) is skipped by heap walks: reading it is ~200x slower.
+	{
+		auto* wc = static_cast<uint64_t*>(VirtualAlloc(nullptr, 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE));
+		auto* nm = static_cast<uint64_t*>(VirtualAlloc(nullptr, 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+		const uint64_t marker = 0x5EC0DE5EC0DE1234ull;
+		wc[100] = marker;
+		nm[100] = marker;
+		auto hits = ScanHeap(marker, 16);
+		CHECK(std::find(hits.begin(), hits.end(), reinterpret_cast<uintptr_t>(&nm[100])) != hits.end());
+		CHECK(std::find(hits.begin(), hits.end(), reinterpret_cast<uintptr_t>(&wc[100])) == hits.end());
+		VirtualFree(wc, 0, MEM_RELEASE);
+		VirtualFree(nm, 0, MEM_RELEASE);
+	}
+
 	// ---- Wwise detours on stand-ins ----
 	using namespace wwise;
 	g_double = false;

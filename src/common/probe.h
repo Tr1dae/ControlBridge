@@ -364,21 +364,43 @@ namespace cb
 	}
 
 	// ---- heap scans --------------------------------------------------------------------------------------
+	inline double g_scanBudget = 30.0;  // seconds per heap walk; a scan that runs longer stops (logged)
+
+	// Committed private read-write memory, skipping write-combined and uncached pages (GPU upload /
+	// readback heaps: test 3 hung there, CPU reads of write-combined memory are ~200x slower) and
+	// guard pages. Logs progress every 5 s.
 	template <class F>
 	inline void ForEachHeapRegion(F&& a_fn)
 	{
 		MEMORY_BASIC_INFORMATION mbi;
 		uintptr_t a = 0x10000;
+		double    t0 = Now(), nextLog = t0 + 5.0;
+		uint64_t  bytes = 0, skippedWc = 0;
 		while (VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi))) {
 			uintptr_t b = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
 			DWORD     p = mbi.Protect & 0xFF;
 			if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && !(mbi.Protect & PAGE_GUARD) &&
 				(p == PAGE_READWRITE || p == PAGE_EXECUTE_READWRITE)) {
-				a_fn(b, mbi.RegionSize);
+				if (mbi.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) {
+					skippedWc += mbi.RegionSize;
+				} else {
+					a_fn(b, mbi.RegionSize);
+					bytes += mbi.RegionSize;
+				}
+				double now = Now();
+				if (now > nextLog) {
+					nextLog = now + 5.0;
+					Log("  scan: %.2f GB in %.1f s", bytes / 1073741824.0, now - t0);
+				}
+				if (now - t0 > g_scanBudget) {
+					Log("  scan: time budget (%.0f s) hit after %.2f GB, stopping early", g_scanBudget, bytes / 1073741824.0);
+					return;
+				}
 			}
 			a = b + mbi.RegionSize;
 			if (a < b) break;
 		}
+		Log("  scan: %.2f GB in %.1f s (%.2f GB write-combined/uncached skipped)", bytes / 1073741824.0, Now() - t0, skippedWc / 1073741824.0);
 	}
 
 	// ---- fast in-place scans ---------------------------------------------------------------------------

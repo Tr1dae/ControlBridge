@@ -199,6 +199,20 @@ an alt-tab. Analysis: `tools/analyze_frames.py` plus the camera-turn check.
   the views scan and quit during the snapshot. The probe now chimes (Windows sounds) at "walk now",
   "walk again" and "done".
 
+## In-game test 3 (2026-10-11)
+
+- **Control camera solved:** `g_pRenderView` points at a static `m::View` inside `Control_DX12.exe`.
+  It gives position, axes and fovY 43 deg every frame.
+- **Resonant ECS observers:** `applyControllerToTransform` runs about 30 times/s on varying worker
+  threads (frames about 130/s), so it looks like a fixed 30 Hz simulation step. Its first argument is a
+  stack context, not the world. `cameramixer::camera_update` runs 17 to 100/s, varying.
+- **Both games: the first heap scan never finished.** Cause, reproduced offline: scanning in place
+  reads GPU upload/readback heaps, which are write-combined, and CPU reads of write-combined memory are
+  about 200x slower (256 MB: 4.2 s vs 0.02 s). Heap walks now skip `PAGE_WRITECOMBINE` /
+  `PAGE_NOCACHE`, log progress, stop after 30 s, and auto recon runs on its own thread (snapshot
+  first, then views). The chimes never played because the scan never ended; they now also sound an
+  explicit `Beep()` tone.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
