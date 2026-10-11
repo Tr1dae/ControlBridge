@@ -1,22 +1,32 @@
-// Phase 1b: Dylan follows Jesse. applyControllerToTransform (30 Hz ECS system, run thunk
-// exe+1bc6500) calls a per-entity function (exe+1bc08f0, ctx in rcx) that reads the controller's
-// position through ctx: idx = [ctx+0x50]; ctrl = [[ctx+8] + idx*32 + 8]; pos = [ctrl+0x10] (32
-// bytes, doubles), and hands it to the transform setter (exe+1836800; exe+1836ad0 on the flagged
-// "teleported" branch). Test 11: writing the ControllerHitReport+0x38 copy did nothing visible, so
-// the puppet now writes into [ctrl+0x10] for Dylan's entity, just before the per-entity function
-// runs. Dylan's entity is recognised the first time its [ctrl+0x10] position matches the tracked
-// controller (player.h).
+// Phase 1b: Dylan follows Jesse, moved with the engine's own teleport (puppet v3).
+//
+// Tests 11-13: writing positions into the character controller (the ControllerHitReport+0x38 copy,
+// then what looked like the position behind applyControllerToTransform's per-entity body) moved
+// nothing. The script binding nl_teleport (Luau table at exe+1a429d0 -> exe+1a38330) shows the
+// real path:
+//   transform = exe+1a480b0(&world, entity)       32-byte component, type hash 0x6cfbb2a9
+//   exe+1838400(&world, entity, &transform32, 0)  sets the world transform (resolves parents)
+//   Teleported[row] = 1                           component type hash 0xc55ae319, so
+//                                                 movementmodel::teleportedPreMovement resyncs the
+//                                                 controller; clearTeleported resets the tag
+// world = [rcx] of any system run thunk. entity = 32-bit index into [world+0x58530] (entry: low 16
+// bits archetype, 0xffff = free; high 32 bits row). Column lookup: exe+32ced90(cols, count, hash)
+// on the archetype record at world + (archetype + 0xc22) * 32 (+0x10 cols, +0x24 count); column
+// offsets at [world + archetype*32 + 0x18458]; chunk base at [world + archetype*8 + 0x50].
+//
+// Everything runs inside applyControllerToTransform's run thunk (exe+1bc6500), after the original:
+// on the game's thread, in the phase that writes controller transforms. Dylan's entity is found by
+// matching transforms against the tracked controller (player.h); the candidates are logged.
 //
 // Mapping, fixed when puppet mode starts (or on re-anchor): both games are left-handed, Y up,
 // metres (test 1), so
 //     dylan = dylan0 + Ry(theta) * (jesse - jesse0)
-// with theta the yaw difference between the two cameras at that moment, so "forward" is the same
-// direction in both views. Jesse falling more than 50 m below the anchor stops the follow (Resonant
-// autosaves; never leave Dylan under the map).
+// with theta the yaw difference between the two cameras at that moment. Jesse falling more than
+// 50 m below the anchor stops the follow (Resonant autosaves; never leave Dylan under the map).
 //
-// Hotkeys while Resonant is in front (keys games rarely bind; something reacted to F7 in test 11):
-// Insert puppet on/off, Home back to where puppet mode started, Page Up re-anchor. Commands (resonant_cmd.txt): puppet on|off, home, anchor, pos, tp <dx> <dy> <dz>,
-// tpabs <x> <y> <z>.
+// Hotkeys while Resonant is in front: Insert puppet on/off, Home back to where puppet mode started,
+// Page Up re-anchor. Commands (resonant_cmd.txt): puppet on|off, home, anchor, pos, tp <dx> <dy>
+// <dz>, tpabs <x> <y> <z>, rescan.
 #pragma once
 
 #include <cmath>
@@ -33,29 +43,19 @@ namespace cb::puppet
 
 	inline std::atomic<bool> g_on{ false };
 	inline SRWLOCK           g_lock = SRWLOCK_INIT;
-	inline double            g_dylan0[3], g_jesse0[3], g_theta = 0;  // anchor
+	inline double            g_dylan0[3], g_jesse0[3], g_theta = 0;  // anchor (controller/feet space)
 	inline bool              g_anchored = false;
 	inline double            g_home[3];
 	inline bool              g_haveHome = false;
 
-	// One-shot teleport request (from commands / F8), applied on the next system run.
+	// One-shot teleport request (commands / Home), applied on the next system run.
 	inline bool   g_tpPending = false, g_tpRelative = false;
 	inline double g_tp[3];
 
-	inline std::atomic<uint64_t> g_calls{ 0 }, g_writes{ 0 }, g_mismatch{ 0 }, g_refused{ 0 };
-	inline std::atomic<uintptr_t> g_ctrl{ 0 }, g_ctrlFor{ 0 };
-	inline double                 g_off[3] = {};  // [ctrl+0x10] position minus the hit-report copy (origin shift, capsule centre)
-
-	// While Dylan's entity is unknown: the last few entities seen (logged in the summary).
-	struct Sample
-	{
-		uintptr_t ctrl, p;
-		double    v[4];
-	};
-	inline Sample                g_samples[16];
-	inline std::atomic<uint32_t> g_sampleN{ 0 };  // Dylan's controller object, and the tracked hit report it belongs to
+	inline std::atomic<uint64_t> g_calls{ 0 }, g_writes{ 0 }, g_failed{ 0 }, g_refused{ 0 };
 	inline double                g_lastTarget[3] = {};
 
+	// ---- the link and the anchor ---------------------------------------------------------------
 	inline double Yaw(const float* a_fwd) { return std::atan2(a_fwd[0], a_fwd[2]); }  // 0 = +Z
 
 	inline bool Guest(proto::GuestState& a_g)
@@ -117,25 +117,7 @@ namespace cb::puppet
 		ReleaseSRWLockExclusive(&g_lock);
 	}
 
-	inline void WriteRaw(uintptr_t a_at, const double* a_p)
-	{
-		__try {
-			memcpy(reinterpret_cast<void*>(a_at), a_p, 24);
-		} __except (EXCEPTION_EXECUTE_HANDLER) {
-		}
-	}
-
-	// The position pointer the per-entity function reads, or 0.
-	inline uintptr_t PosPtr(uintptr_t a_ctx, uintptr_t& a_ctrl)
-	{
-		uintptr_t idx = 0, flags = 0, arr = 0, p = 0;
-		uint8_t   skip = 1;
-		if (!Read(a_ctx + 0x50, idx) || !Read(a_ctx, flags) || !Read(flags + idx * 2, skip) || skip) return 0;
-		if (!Read(a_ctx + 8, arr) || !Read(arr + idx * 32 + 8, a_ctrl) || !a_ctrl || !Read(a_ctrl + 0x10, p)) return 0;
-		return p;
-	}
-
-	// Target for this step (caller holds g_lock), false if nothing to write.
+	// Target for this step in controller (feet) space, false if nothing to write. Caller holds g_lock.
 	inline bool TargetLocked(const double* a_cur, double* a_target)
 	{
 		if (g_tpPending) {
@@ -164,55 +146,172 @@ namespace cb::puppet
 		return true;
 	}
 
-	// Per-entity body of applyControllerToTransform (pointer arguments only).
-	inline uintptr_t EntityDetour(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f)
+	// ---- the ECS teleport (build 25767184 addresses) -------------------------------------------------
+	inline constexpr uint32_t kLookupRva = 0x1a480b0, kSetWorldRva = 0x1838400, kFindColRva = 0x32ced90;
+	inline constexpr uint32_t kTeleportedHash = 0xc55ae319;
+	using LookupFn = uintptr_t (*)(const uintptr_t*, uint32_t);
+	using SetWorldFn = void (*)(const uintptr_t*, uint64_t, const void*, uint8_t);
+	using FindColFn = int (*)(uintptr_t, uint32_t, uint32_t);
+	inline LookupFn   g_lookup = nullptr;
+	inline SetWorldFn g_setWorld = nullptr;
+	inline FindColFn  g_findCol = nullptr;
+
+	inline std::atomic<uintptr_t> g_world{ 0 };
+	inline std::atomic<int64_t>   g_entity{ -1 };    // Dylan's entity index
+	inline uintptr_t              g_entityFor = 0;   // the controller (hit report) it was matched to
+	inline double                 g_nextScan = 0;
+	inline double                 g_posOff[3] = {};  // transform position minus the controller copy
+	inline std::atomic<bool>      g_rescan{ false };
+
+	inline bool Entry(uintptr_t a_world, uint32_t a_idx, uint16_t& a_arch, uint32_t& a_row)
+	{
+		uintptr_t table = 0;
+		uint64_t  e = 0;
+		if (!Read(a_world + 0x58530, table) || !table || !Read(table + uint64_t(a_idx) * 8, e)) return false;
+		a_arch = static_cast<uint16_t>(e);
+		a_row = static_cast<uint32_t>(e >> 32);
+		return a_arch != 0xffff;
+	}
+
+	inline uintptr_t CallLookup(uintptr_t a_world, uint32_t a_idx)
+	{
+		__try {
+			return g_lookup(&a_world, a_idx);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return 0;
+		}
+	}
+
+	inline bool CallSetWorld(uintptr_t a_world, uint32_t a_idx, const void* a_xf)
+	{
+		__try {
+			g_setWorld(&a_world, a_idx, a_xf, 0);
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	inline int CallFindCol(uintptr_t a_cols, uint32_t a_n, uint32_t a_hash)
+	{
+		__try {
+			return g_findCol(a_cols, a_n, a_hash);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return -1;
+		}
+	}
+
+	inline bool SetByte(uintptr_t a_at)
+	{
+		__try {
+			*reinterpret_cast<volatile uint8_t*>(a_at) = 1;
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// Sets the entity's Teleported byte, as nl_teleport does.
+	inline bool MarkTeleported(uintptr_t a_world, uint32_t a_idx)
+	{
+		uint16_t  arch;
+		uint32_t  row, n = 0, off = 0;
+		uintptr_t cols = 0, offs = 0, chunk = 0;
+		if (!Entry(a_world, a_idx, arch, row)) return false;
+		uintptr_t rec = a_world + (uintptr_t(arch) + 0xc22) * 32;
+		if (!Read(rec + 0x10, cols) || !Read(rec + 0x24, n)) return false;
+		int col = CallFindCol(cols, n, kTeleportedHash);
+		if (col < 0 || !Read(a_world + uintptr_t(arch) * 32 + 0x18458, offs) || !Read(offs + uintptr_t(col) * 4, off) || !off ||
+			!Read(a_world + uintptr_t(arch) * 8 + 0x50, chunk))
+			return false;
+		return SetByte(chunk + off + row);
+	}
+
+	// Finds Dylan's entity: the transform whose position (doubles at +0) sits on the tracked controller.
+	// The nearest candidates are logged under two layouts in case that assumption is wrong.
+	inline void Scan(uintptr_t a_world, uintptr_t a_hit)
+	{
+		double want[3];
+		if (!player::Pos(a_hit, want)) return;
+		struct Cand
+		{
+			double   d;
+			uint32_t idx;
+			uint8_t  raw[32];
+		};
+		std::vector<Cand> c;
+		uintptr_t         table = 0;
+		uint32_t          live = 0, idx = 0;
+		if (!Read(a_world + 0x58530, table) || !table) return;
+		for (; idx < (1u << 20) && Readable(table + uint64_t(idx) * 8, 8); ++idx) {
+			uint16_t arch;
+			uint32_t row;
+			if (!Entry(a_world, idx, arch, row)) continue;
+			++live;
+			uintptr_t t = CallLookup(a_world, idx);
+			Cand      x{ 1e30, idx, {} };
+			if (!t || !SafeRead(x.raw, t, 32)) continue;
+			double p[3];
+			memcpy(p, x.raw, 24);
+			if (std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]))
+				x.d = std::hypot(p[0] - want[0], p[2] - want[2]) + 0.1 * std::fabs(p[1] - want[1]);
+			c.push_back(x);
+		}
+		std::sort(c.begin(), c.end(), [](const Cand& a, const Cand& b) { return a.d < b.d; });
+		Log("puppet: entity scan: %u table entries, %u live, %zu with a transform; Dylan's controller at %.2f %.2f %.2f; nearest:", idx, live,
+			c.size(), want[0], want[1], want[2]);
+		for (size_t i = 0; i < c.size() && i < 5; ++i) {
+			double d[4];
+			float  f[8];
+			memcpy(d, c[i].raw, 32);
+			memcpy(f, c[i].raw, 32);
+			Log("    entity %u: score %.3f | doubles %.3f %.3f %.3f %.3f | floats %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f", c[i].idx, c[i].d, d[0], d[1],
+				d[2], d[3], f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+		}
+		if (!c.empty() && c[0].d < 0.5) {
+			double p[3];
+			memcpy(p, c[0].raw, 24);
+			for (int i = 0; i < 3; ++i) g_posOff[i] = p[i] - want[i];
+			g_entity = c[0].idx;
+			g_entityFor = a_hit;
+			Log("puppet: Dylan = entity %u (transform %+.3f %+.3f %+.3f from the controller copy)", c[0].idx, g_posOff[0], g_posOff[1], g_posOff[2]);
+		}
+	}
+
+	// applyControllerToTransform's run thunk (pointer arguments only; [rcx] = ECS world).
+	inline uintptr_t ThunkDetour(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f)
 	{
 		g_calls.fetch_add(1, std::memory_order_relaxed);
-		uintptr_t ctrl = 0, p = PosPtr(a, ctrl), hit = player::g_obj.load();
-		if (p && hit) {
-			if (g_ctrlFor.load() != hit) {  // (re)identify Dylan's entity
-				// Test 12: no [ctrl+0x10] position matched Dylan's horizontally, so identify him by structure
-				// (his ControllerHitReport lives inside his controller object, just above ctrl) and measure
-				// the offset between the two positions instead of assuming one.
-				long long rel = static_cast<long long>(hit) - static_cast<long long>(ctrl);
-				double    pos[3] = {}, want[3] = {};
-				bool      have = SafeRead(pos, p, 24) && player::Pos(hit, want);
-				bool      near_ = have && std::hypot(pos[0] - want[0], pos[2] - want[2]) < 0.3 && std::fabs(pos[1] - want[1]) < 2.0;
-				if (have && ((rel >= 0 && rel < 0x2000) || near_)) {
-					for (int i = 0; i < 3; ++i) g_off[i] = pos[i] - want[i];
-					g_ctrl = ctrl;
-					g_ctrlFor = hit;
-					Log("puppet: Dylan's entity found (%s): controller %p, hit report = ctrl%+lld; [ctrl+0x10] = %p holds %.3f %.3f %.3f, "
-						"hit-report copy %.3f %.3f %.3f, offset %+.3f %+.3f %+.3f",
-						near_ ? "position match" : "hit report inside controller", reinterpret_cast<void*>(ctrl), rel, reinterpret_cast<void*>(p), pos[0], pos[1],
-						pos[2], want[0], want[1], want[2], g_off[0], g_off[1], g_off[2]);
-				} else {
-					Sample& sm = g_samples[g_sampleN.fetch_add(1) % 16];
-					sm.ctrl = ctrl;
-					sm.p = p;
-					SafeRead(sm.v, p, 32);
-				}
-			}
-			if (ctrl == g_ctrl.load() && (g_on.load() || g_tpPending)) {
-				double cur[3], target[3];
-				bool   write = false;
-				if (SafeRead(cur, p, 24)) {
-					for (int i = 0; i < 3; ++i) cur[i] -= g_off[i];
-					AcquireSRWLockExclusive(&g_lock);
-					write = TargetLocked(cur, target);
-					ReleaseSRWLockExclusive(&g_lock);
-				}
-				if (write) {  // target is in hit-report (feet) space; [ctrl+0x10] sits g_off from it
-					double atCtrl[3] = { target[0] + g_off[0], target[1] + g_off[1], target[2] + g_off[2] };
-					WriteRaw(p, atCtrl);
-					WriteRaw(hit + player::kPosOff, target);
-					WriteRaw(hit + player::kPrevOff, target);
-					memcpy(g_lastTarget, target, 24);
-					g_writes.fetch_add(1, std::memory_order_relaxed);
-				}
-			}
+		uintptr_t r = g_applyOrig(a, b, c, d, e, f);
+		uintptr_t world = 0, hit = player::g_obj.load();
+		if (!Read(a, world) || !world || !hit) return r;
+		g_world = world;
+		if ((g_entityFor != hit || g_rescan.exchange(false)) && Now() >= g_nextScan) {  // (re)find Dylan's entity
+			g_nextScan = Now() + 2.0;
+			Scan(world, hit);
 		}
-		return g_applyOrig(a, b, c, d, e, f);
+		int64_t ent = g_entity.load();
+		if (ent < 0 || g_entityFor != hit || !(g_on.load() || g_tpPending)) return r;
+		uintptr_t t = CallLookup(world, static_cast<uint32_t>(ent));
+		uint8_t   xf[32];
+		if (!t || !SafeRead(xf, t, 32)) return r;
+		double cur[3], target[3];
+		memcpy(cur, xf, 24);
+		for (int i = 0; i < 3; ++i) cur[i] -= g_posOff[i];  // to controller (feet) space
+		AcquireSRWLockExclusive(&g_lock);
+		bool write = TargetLocked(cur, target);
+		ReleaseSRWLockExclusive(&g_lock);
+		if (!write) return r;
+		double at[3] = { target[0] + g_posOff[0], target[1] + g_posOff[1], target[2] + g_posOff[2] };
+		memcpy(xf, at, 24);  // position replaced, the rest (rotation) kept
+		bool ok = CallSetWorld(world, static_cast<uint32_t>(ent), xf) && MarkTeleported(world, static_cast<uint32_t>(ent));
+		if (ok) {
+			memcpy(g_lastTarget, target, 24);
+			g_writes.fetch_add(1, std::memory_order_relaxed);
+		} else if (g_failed.fetch_add(1) < 3) {
+			Log("puppet: teleport failed for entity %lld", static_cast<long long>(ent));
+		}
+		return r;
 	}
 
 	// ---- hotkeys (worker tick) -------------------------------------------------------------------
@@ -248,22 +347,10 @@ namespace cb::puppet
 	inline void Summary()
 	{
 		if (!g_applyOrig) return;
-		if (!g_ctrl.load() && g_sampleN.load()) {
-			uintptr_t hit = player::g_obj.load();
-			double    want[3] = {};
-			player::Pos(hit, want);
-			Log("puppet: Dylan's entity not found yet; hit report %p at %.2f %.2f %.2f; recent entities:", reinterpret_cast<void*>(hit), want[0], want[1],
-				want[2]);
-			for (int i = 0; i < 16 && i < static_cast<int>(g_sampleN.load()); ++i) {
-				const Sample& sm = g_samples[i];
-				Log("    ctrl %p (hit - ctrl %+lld) [ctrl+0x10] %p: %.3f %.3f %.3f %.3f", reinterpret_cast<void*>(sm.ctrl),
-					static_cast<long long>(hit) - static_cast<long long>(sm.ctrl), reinterpret_cast<void*>(sm.p), sm.v[0], sm.v[1], sm.v[2], sm.v[3]);
-			}
-		}
-		Log("puppet: %s; entity calls %llu, Dylan's entity %s, writes %llu, refused (Jesse fell) %llu; last target %.2f %.2f %.2f",
-			g_on.load() ? "ON" : "off", static_cast<unsigned long long>(g_calls.load()), g_ctrl.load() ? "known" : "not yet",
-			static_cast<unsigned long long>(g_writes.load()), static_cast<unsigned long long>(g_refused.load()), g_lastTarget[0], g_lastTarget[1],
-			g_lastTarget[2]);
+		Log("puppet: %s; system runs %llu, Dylan's entity %lld, teleports %llu, failed %llu, refused (Jesse fell) %llu; last target %.2f %.2f %.2f",
+			g_on.load() ? "ON" : "off", static_cast<unsigned long long>(g_calls.load()), static_cast<long long>(g_entity.load()),
+			static_cast<unsigned long long>(g_writes.load()), static_cast<unsigned long long>(g_failed.load()),
+			static_cast<unsigned long long>(g_refused.load()), g_lastTarget[0], g_lastTarget[1], g_lastTarget[2]);
 	}
 
 	inline bool Command(int argc, char** argv)
@@ -278,6 +365,9 @@ namespace cb::puppet
 			AcquireSRWLockExclusive(&g_lock);
 			AnchorLocked();
 			ReleaseSRWLockExclusive(&g_lock);
+		} else if (!_stricmp(c, "rescan")) {
+			g_rescan = true;
+			g_nextScan = 0;
 		} else if (!_stricmp(c, "pos")) {
 			double p[3];
 			if (player::Pos(player::g_obj.load(), p)) Log("pos: Dylan %.3f %.3f %.3f", p[0], p[1], p[2]);
@@ -291,9 +381,11 @@ namespace cb::puppet
 		return true;
 	}
 
-	inline void Install(void* a_entityFn)
+	inline void Install(uintptr_t a_exe, void* a_thunk)
 	{
-		Hook(a_entityFn, reinterpret_cast<void*>(&EntityDetour), reinterpret_cast<void**>(&g_applyOrig),
-			"applyControllerToTransform per-entity (puppet)");
+		g_lookup = reinterpret_cast<LookupFn>(a_exe + kLookupRva);
+		g_setWorld = reinterpret_cast<SetWorldFn>(a_exe + kSetWorldRva);
+		g_findCol = reinterpret_cast<FindColFn>(a_exe + kFindColRva);
+		Hook(a_thunk, reinterpret_cast<void*>(&ThunkDetour), reinterpret_cast<void**>(&g_applyOrig), "applyControllerToTransform (puppet teleport)");
 	}
 }

@@ -383,6 +383,30 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
 - Something in Resonant reacted to F7 (the weapon-wheel UI moved). Hotkeys are now Insert (on/off),
   Home (back to the start), Page Up (re-anchor).
 
+## In-game tests 12-13 (2026-10-11): finding a real way to move Dylan
+
+- Test 12: the per-entity hook ran (about 660 calls/s), but no `[ctrl+0x10]` matched Dylan.
+- Test 13 logged what each entity's pointer holds: tiny values and huge numbers, so not a position.
+  That reading of the per-entity body was wrong.
+- **The engine's own teleport**, from the Luau binding table (exe+1a429d0: `{name, C function}`
+  pairs, e.g. `nl_world_axis_x`, `nl_teleport`, `nl_look_at`, `nl_transform_point_*`). `nl_teleport`
+  = exe+1a38330:
+  - entity = Lua arg 1 (64-bit handle; the low 32 bits index `[world+0x58530]`)
+  - transform pointer = exe+1a480b0(&world, entity): 32-byte component, type hash 0x6cfbb2a9,
+    `chunk + columnOffset + row*32`
+  - exe+1838400(&world, entity, &transform32): set world transform (only `[rcx]` = world is used,
+    and only the low 32 bits of the entity)
+  - sets the `Teleported` byte: column type hash 0xc55ae319, `byte[chunk + colOffset + row] = 1`
+- ECS layout used:
+  - world = `[rcx]` of any system run thunk
+  - entity table `[world+0x58530]`: entry low 16 bits = archetype (0xffff free), high 32 = row
+  - archetype record world + (archetype + 0xc22)*32: +0x10 columns, +0x24 count; exe+32ced90(cols,
+    count, hash) finds a column
+  - column offsets `[world + archetype*32 + 0x18458]`, chunk base `[world + archetype*8 + 0x50]`
+- Puppet v3 does exactly what nl_teleport does, inside applyControllerToTransform's run thunk after
+  the original. Dylan's entity is found by scanning the entity table for the transform nearest the
+  tracked controller; the candidates are logged as doubles and floats.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`

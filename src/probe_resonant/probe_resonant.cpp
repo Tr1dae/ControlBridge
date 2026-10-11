@@ -62,8 +62,8 @@ namespace
 			{ 0x2825130, "cameramixer::camera_update" },
 		};
 		if (Nt(exe)->FileHeader.TimeDateStamp == 0x6ac4318a) {
-			puppet::Install(reinterpret_cast<void*>(g_exe + 0x1bc08f0));  // applyControllerToTransform's per-entity body drives Dylan
-			for (int i = 0; i < 3; ++i) {
+			puppet::Install(g_exe, reinterpret_cast<void*>(g_exe + kSys25767184[0].rva));  // teleports Dylan (puppet.h)
+			for (int i = 1; i < 3; ++i) {
 				void* t = reinterpret_cast<void*>(g_exe + kSys25767184[i].rva);
 				ObsSlot& o = g_obs[i];
 				strncpy_s(o.name, kSys25767184[i].name, _TRUNCATE);
