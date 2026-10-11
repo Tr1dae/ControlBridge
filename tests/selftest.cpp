@@ -275,6 +275,24 @@ int main()
 		CHECK(watched);
 	}
 
+	// ---- IAT hook: this exe's own import of GetCurrentProcessId ----
+	{
+		using PidFn = DWORD(WINAPI*)();
+		static PidFn s_orig = nullptr;
+		struct D
+		{
+			static DWORD WINAPI Pid() { return 4242; }
+		};
+		DWORD real = GetCurrentProcessId();
+		s_orig = reinterpret_cast<PidFn>(IatHook(GetModuleHandleW(nullptr), "KERNEL32.dll", 0, "GetCurrentProcessId", reinterpret_cast<void*>(&D::Pid)));
+		CHECK(s_orig != nullptr);
+		CHECK(GetCurrentProcessId() == 4242);  // calls through the import table now
+		CHECK(s_orig && s_orig() == real);
+		IatHook(GetModuleHandleW(nullptr), "KERNEL32.dll", 0, "GetCurrentProcessId", reinterpret_cast<void*>(s_orig));
+		CHECK(GetCurrentProcessId() == real);
+		CHECK(IatHook(GetModuleHandleW(nullptr), "NOSUCH.dll", 2, nullptr, reinterpret_cast<void*>(&D::Pid)) == nullptr);
+	}
+
 	std::string log = ReadAll(Path(L"selftest_probe.log"));
 	CHECK(log.find("autofind round 2") != std::string::npos || log.find("autofind: done") != std::string::npos);
 	CHECK(log.find("obs 2 fake_system") != std::string::npos);

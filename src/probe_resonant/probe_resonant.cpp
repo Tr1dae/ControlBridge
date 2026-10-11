@@ -11,6 +11,7 @@
 // Commands go to logs\resonant_cmd.txt (see README).
 #include "../common/bridge.h"
 #include "../common/probe.h"
+#include "../common/video.h"
 #include "../common/wwise.h"
 #include "player.h"
 #include "puppet.h"
@@ -44,6 +45,7 @@ namespace
 	DWORD WINAPI Worker(void* a_self)
 	{
 		Init(static_cast<HMODULE>(a_self), L"resonant");
+		video::Install();  // first: the intros start within seconds
 		HMODULE exe = GetModuleHandleW(nullptr);
 		wwise::Install(exe);
 		wwise::views::g_mod = exe;

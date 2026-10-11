@@ -437,6 +437,23 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
   `coregame::component::CharacterController` (then `Player`, `ActiveAvatar`); each candidate's
   component flags are logged.
 
+## In-game test 16 (2026-10-11): **Dylan follows Jesse**
+
+- With the root entity (CharacterController owner), the teleport works: moving Jesse moves Dylan,
+  and Resonant's camera follows him. Jesse's step down in Control pushed Dylan into Resonant's ground,
+  and he was corrected violently.
+- With Resonant in front, Dylan "hyper-warped" between the puppet anchor and wherever the pad walked
+  him: both his own input and the teleports moved him.
+- Fixes:
+  - **Input filter:** the exe's `XINPUT1_4 #2` import (IAT exe+3acc688 in this build, found by
+    walking the import table) clears the left stick, triggers and buttons except Start/Back while
+    puppet mode is on. The probe's own pad sampler, and so Jesse's virtual pad, is unaffected.
+  - **Horizontal follow by default:** Dylan's height stays with Resonant's physics until Phase 2.
+    Page Down toggles full 3D follow.
+- **Intro skip (SkipIntros=1, both games):** `bink2w64!BinkOpen` (Control) and `BinkOpenWithOptions`
+  (Resonant) are hooked; every opened video is logged by name, and names matching `SkipVideos`
+  substrings are refused. Every call site checks for a failed open, so playback is just skipped.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`

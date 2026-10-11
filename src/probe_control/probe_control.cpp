@@ -13,6 +13,7 @@
 
 #include "../common/probe.h"
 #include "../common/bridge.h"
+#include "../common/video.h"
 #include "../common/wwise.h"
 #include "focus.h"
 #include "gamepad.h"
@@ -281,6 +282,7 @@ namespace
 	DWORD WINAPI Worker(void* a_self)
 	{
 		Init(static_cast<HMODULE>(a_self), L"control");
+		video::Install();  // first: the intros start within seconds
 		// DX12 build uses the *_rmdwin10_f.dll set, DX11 the *_rmdwin7_f.dll set.
 		HMODULE core = nullptr, snd = nullptr, rl = nullptr;
 		for (int i = 0; i < 600 && !(core && snd && rl); ++i) {

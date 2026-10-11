@@ -257,6 +257,35 @@ namespace cb
 		return true;
 	}
 
+	// Points a_mod's import of a_dll!#a_ordinal (or by name if a_name) at a_detour; returns the previous
+	// pointer, or nullptr if the import isn't there. Only that module's calls are affected.
+	inline void* IatHook(HMODULE a_mod, const char* a_dll, WORD a_ordinal, const char* a_name, void* a_detour)
+	{
+		auto  b = reinterpret_cast<uintptr_t>(a_mod);
+		auto& dd = Nt(a_mod)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+		if (!dd.VirtualAddress) return nullptr;
+		for (auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(b + dd.VirtualAddress); d->Name; ++d) {
+			if (_stricmp(reinterpret_cast<const char*>(b + d->Name), a_dll)) continue;
+			auto* orig = reinterpret_cast<IMAGE_THUNK_DATA64*>(b + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
+			auto* iat = reinterpret_cast<IMAGE_THUNK_DATA64*>(b + d->FirstThunk);
+			for (; orig->u1.AddressOfData; ++orig, ++iat) {
+				bool byOrd = IMAGE_SNAP_BY_ORDINAL64(orig->u1.Ordinal);
+				bool hit = byOrd ? (!a_name && IMAGE_ORDINAL64(orig->u1.Ordinal) == a_ordinal)
+				                 : (a_name && !strcmp(reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(b + orig->u1.AddressOfData)->Name, a_name));
+				if (!hit) continue;
+				DWORD old;
+				VirtualProtect(&iat->u1.Function, 8, PAGE_READWRITE, &old);
+				void* prev = reinterpret_cast<void*>(iat->u1.Function);
+				iat->u1.Function = reinterpret_cast<ULONGLONG>(a_detour);
+				VirtualProtect(&iat->u1.Function, 8, old, &old);
+				Log("iat hook %s!%s @ %s", a_dll, a_name ? a_name : ("#" + std::to_string(a_ordinal)).c_str(), Rva(reinterpret_cast<uintptr_t>(&iat->u1.Function)).c_str());
+				return prev;
+			}
+		}
+		Log("iat hook %s!%s: import not found", a_dll, a_name ? a_name : ("#" + std::to_string(a_ordinal)).c_str());
+		return nullptr;
+	}
+
 	inline bool Unhook(void* a_target)
 	{
 		MH_STATUS s = MH_DisableHook(a_target);

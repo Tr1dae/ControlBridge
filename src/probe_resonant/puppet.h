@@ -26,7 +26,7 @@
 // 50 m below the anchor stops the follow (Resonant autosaves; never leave Dylan under the map).
 //
 // Hotkeys while Resonant is in front: Insert puppet on/off, Home back to where puppet mode started,
-// Page Up re-anchor. Commands (resonant_cmd.txt): puppet on|off, home, anchor, pos, tp <dx> <dy>
+// Page Up re-anchor, Page Down horizontal / 3D follow. Commands (resonant_cmd.txt): puppet on|off, home, anchor, pos, tp <dx> <dy>
 // <dz>, tpabs <x> <y> <z>, rescan.
 #pragma once
 
@@ -55,6 +55,32 @@ namespace cb::puppet
 
 	inline std::atomic<uint64_t> g_calls{ 0 }, g_writes{ 0 }, g_failed{ 0 }, g_refused{ 0 };
 	inline double                g_lastTarget[3] = {};
+
+	// Test 16: following Jesse's height pushed Dylan into Resonant's ground (Control's floors aren't
+	// Manhattan's until Phase 2). Default: horizontal only, Dylan's height stays with Resonant's
+	// physics. Page Down toggles full 3D follow.
+	inline std::atomic<bool> g_follow3D{ false };
+
+	// ---- Resonant's own controller input while puppet mode is on ---------------------------------
+	// Test 16: Dylan also obeyed the pad, so he and the teleports fought ("warping"). The exe's
+	// XInputGetState import (XINPUT1_4 #2) is filtered: left stick, triggers and buttons are cleared
+	// except Start/Back (menus); the right stick (camera) passes. Jesse still gets everything: the
+	// probe's pad sampler calls xinput directly, not through the exe's import.
+	using XGetStateFn = DWORD(WINAPI*)(DWORD, XState*);
+	inline XGetStateFn           g_xgetOrig = nullptr;
+	inline std::atomic<uint64_t> g_filtered{ 0 };
+
+	inline DWORD WINAPI XGetStateDetour(DWORD a_i, XState* a_s)
+	{
+		DWORD r = g_xgetOrig(a_i, a_s);
+		if (r == ERROR_SUCCESS && a_s && g_on.load(std::memory_order_relaxed)) {
+			a_s->buttons &= 0x0010 | 0x0020;  // XINPUT_GAMEPAD_START | BACK
+			a_s->lt = a_s->rt = 0;
+			a_s->lx = a_s->ly = 0;
+			g_filtered.fetch_add(1, std::memory_order_relaxed);
+		}
+		return r;
+	}
 
 	// ---- the link and the anchor ---------------------------------------------------------------
 	inline double Yaw(const float* a_fwd) { return std::atan2(a_fwd[0], a_fwd[2]); }  // 0 = +Z
@@ -138,7 +164,7 @@ namespace cb::puppet
 		double dx = g.jesse.pos[0] - g_jesse0[0], dy = g.jesse.pos[1] - g_jesse0[1], dz = g.jesse.pos[2] - g_jesse0[2];
 		double c = std::cos(g_theta), s = std::sin(g_theta);
 		a_target[0] = g_dylan0[0] + dx * c + dz * s;
-		a_target[1] = g_dylan0[1] + dy;
+		a_target[1] = g_follow3D.load() ? g_dylan0[1] + dy : a_cur[1];  // horizontal only: Resonant keeps his height
 		a_target[2] = g_dylan0[2] - dx * s + dz * c;
 		if (dy < -50.0) {
 			g_refused.fetch_add(1);  // Jesse fell far: don't drag Dylan under the map
@@ -399,7 +425,7 @@ namespace cb::puppet
 	}
 
 	// ---- hotkeys (worker tick) -------------------------------------------------------------------
-	inline bool g_keyDown[3] = {};
+	inline bool g_keyDown[4] = {};
 
 	inline void Tick()
 	{
@@ -413,8 +439,8 @@ namespace cb::puppet
 		DWORD pid = 0;
 		GetWindowThreadProcessId(GetForegroundWindow(), &pid);
 		if (pid != GetCurrentProcessId()) return;
-		const int keys[3] = { VK_INSERT, VK_HOME, VK_PRIOR };
-		for (int i = 0; i < 3; ++i) {
+		const int keys[4] = { VK_INSERT, VK_HOME, VK_PRIOR, VK_NEXT };
+		for (int i = 0; i < 4; ++i) {
 			bool down = (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
 			if (down && !g_keyDown[i]) {
 				if (i == 0) {
@@ -424,11 +450,15 @@ namespace cb::puppet
 						RequestTp(g_home, false);
 						Beep(900, 120);
 					}
-				} else {
+				} else if (i == 2) {
 					AcquireSRWLockExclusive(&g_lock);
 					bool ok = AnchorLocked();
 					ReleaseSRWLockExclusive(&g_lock);
 					Beep(ok ? 1500 : 600, 80);
+				} else {
+					g_follow3D = !g_follow3D.load();
+					Log("puppet: follow %s", g_follow3D.load() ? "3D (Jesse's height too)" : "horizontal (Resonant keeps Dylan's height)");
+					Beep(g_follow3D.load() ? 1800 : 400, 80);
 				}
 			}
 			g_keyDown[i] = down;
@@ -438,10 +468,12 @@ namespace cb::puppet
 	inline void Summary()
 	{
 		if (!g_applyOrig) return;
-		Log("puppet: %s; system runs %llu, Dylan's entity %lld, teleports %llu, failed %llu, refused (Jesse fell) %llu; last target %.2f %.2f %.2f",
-			g_on.load() ? "ON" : "off", static_cast<unsigned long long>(g_calls.load()), static_cast<long long>(g_entity.load()),
-			static_cast<unsigned long long>(g_writes.load()), static_cast<unsigned long long>(g_failed.load()),
-			static_cast<unsigned long long>(g_refused.load()), g_lastTarget[0], g_lastTarget[1], g_lastTarget[2]);
+		Log("puppet: %s (%s); system runs %llu, Dylan's entity %lld, teleports %llu, failed %llu, refused (Jesse fell) %llu, pad reads filtered %llu; "
+			"last target %.2f %.2f %.2f",
+			g_on.load() ? "ON" : "off", g_follow3D.load() ? "3D" : "horizontal", static_cast<unsigned long long>(g_calls.load()),
+			static_cast<long long>(g_entity.load()), static_cast<unsigned long long>(g_writes.load()), static_cast<unsigned long long>(g_failed.load()),
+			static_cast<unsigned long long>(g_refused.load()), static_cast<unsigned long long>(g_filtered.load()), g_lastTarget[0], g_lastTarget[1],
+			g_lastTarget[2]);
 	}
 
 	inline bool Command(int argc, char** argv)
@@ -476,5 +508,6 @@ namespace cb::puppet
 	{
 		g_setWorld = reinterpret_cast<SetWorldFn>(a_exe + kSetWorldRva);
 		Hook(a_thunk, reinterpret_cast<void*>(&ThunkDetour), reinterpret_cast<void**>(&g_applyOrig), "applyControllerToTransform (puppet teleport)");
+		g_xgetOrig = reinterpret_cast<XGetStateFn>(IatHook(reinterpret_cast<HMODULE>(a_exe), "XINPUT1_4.dll", 2, nullptr, reinterpret_cast<void*>(&XGetStateDetour)));
 	}
 }
