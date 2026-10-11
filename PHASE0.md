@@ -105,6 +105,35 @@ named module.
 3. From the CSVs: units, up axis and handedness for both games (forward stick vs position delta), and
    whether listener = camera in each.
 
+## Resonant ECS: system map (2026-10-11, static)
+
+- The exe keeps `ecs::system::getName<&fn>` `__FUNCSIG__` strings for **2,414 ECS systems**.
+  `tools/ecs_systems.py` follows each one to its registration and records the code pointers the
+  registration stores in the system object:
+  - `+0x140` = **run thunk** (iterates the matching entities)
+  - `+0x148` = auxiliary; `exe+3f1d80` is a shared default
+- 2,247 systems resolve; 2,033 run thunks are exact `.pdata` function starts. Output:
+  `dumps/resonant_ecs_systems.json` (not committed: it's derived from the game binary). Re-run it after a
+  game update.
+- A run thunk receives the ECS world in `rcx`. The thunk for `applyControllerToTransform` walks an
+  entity bitset from `[world]+0x58480` (array, `<< 10` per index taken from `[r8+0xC8]`) and
+  `[world]+0x58478`.
+
+| System (build 25767184) | Run thunk | Why it matters |
+|---|---|---|
+| `coregame::charactercontroller::applyControllerToTransform` | `1bc6500` | Writes the character controller's result into the entity transform. **Puppet driving**: run the original, then overwrite the player's transform with Jesse's |
+| `coregame::charactercontroller::prePhysics` / `voxelSweeperEarlyAsyncUpdate` | `1bc5d90` / `1bc5a00` | Controller simulation; may need suppressing for the puppet |
+| `coregame::charactermovement::applyMovement` | `1ba1390` | Animation/locomotion movement into the controller |
+| `coregame::transform::clearTeleported` | `18402a0` | The `Teleported` tag is cleared once per frame, so teleports = write transform + tag Teleported |
+| `heron::fall_respawn::*` | `25f...` | The game's own safe-position and respawn logic. Its cached safe position is a candidate for the safe-teleport command |
+| `heron::cameramixer::camera_update::system` | `2825130` | Final gameplay camera blend: the point where Jesse's camera can replace the host camera (Phase 3) |
+| `coregame::freecamera::update`, `coregame::fpscamera::update` | `1b04680`, `1b0ae70` | Alternative camera override paths (debug/photo cameras) |
+| `heron::player_locomotion::*` | `22bb...` | Player locomotion state, primary/secondary drivers, driver override |
+
+- Components seen in signatures: `WorldTransformReadOnly`, `PreviousWorldTransformReadOnly`,
+  `LocalTransformReadOnly`, `Teleported`, `ActiveAvatar`, `Player`, `CameraView`, `FreeCameraTransform`,
+  `InterpolatedTransform`.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
