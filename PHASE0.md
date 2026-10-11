@@ -465,6 +465,16 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
 - 2026-10-11: the intro skip was removed again (the tester uses dedicated intro-skip mods). The Bink
   findings stay valid: Control's intro is a video texture; never refuse to open it.
 
+## In-game test 18 (2026-10-11): still warping (paused here)
+
+- Tester report: with puppet mode on, Dylan still warps wildly instead of following smoothly, and now
+  moves away from his camera. Logs in `logs/test18/` (not yet analysed).
+- Next time, check first:
+  - whether the pad filter applied (summary `pad reads filtered`)
+  - the yaw offset at anchor time
+  - whether the 30 Hz teleport fights Resonant's own controller step: consider teleporting every
+    frame, or suppressing the controller step for Dylan
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
