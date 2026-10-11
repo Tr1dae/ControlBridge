@@ -44,7 +44,16 @@ namespace cb::puppet
 
 	inline std::atomic<uint64_t> g_calls{ 0 }, g_writes{ 0 }, g_mismatch{ 0 }, g_refused{ 0 };
 	inline std::atomic<uintptr_t> g_ctrl{ 0 }, g_ctrlFor{ 0 };
-	inline double                 g_yOff = 0;  // [ctrl+0x10] height above the hit-report copy  // Dylan's controller object, and the tracked hit report it belongs to
+	inline double                 g_off[3] = {};  // [ctrl+0x10] position minus the hit-report copy (origin shift, capsule centre)
+
+	// While Dylan's entity is unknown: the last few entities seen (logged in the summary).
+	struct Sample
+	{
+		uintptr_t ctrl, p;
+		double    v[4];
+	};
+	inline Sample                g_samples[16];
+	inline std::atomic<uint32_t> g_sampleN{ 0 };  // Dylan's controller object, and the tracked hit report it belongs to
 	inline double                g_lastTarget[3] = {};
 
 	inline double Yaw(const float* a_fwd) { return std::atan2(a_fwd[0], a_fwd[2]); }  // 0 = +Z
@@ -162,30 +171,39 @@ namespace cb::puppet
 		uintptr_t ctrl = 0, p = PosPtr(a, ctrl), hit = player::g_obj.load();
 		if (p && hit) {
 			if (g_ctrlFor.load() != hit) {  // (re)identify Dylan's entity
-				// Horizontal match: [ctrl+0x10] may be the capsule centre rather than the feet.
-				double pos[3], want[3];
-				if (SafeRead(pos, p, 24) && player::Pos(hit, want) && std::hypot(pos[0] - want[0], pos[2] - want[2]) < 0.3 &&
-					std::fabs(pos[1] - want[1]) < 2.0) {
+				// Test 12: no [ctrl+0x10] position matched Dylan's horizontally, so identify him by structure
+				// (his ControllerHitReport lives inside his controller object, just above ctrl) and measure
+				// the offset between the two positions instead of assuming one.
+				long long rel = static_cast<long long>(hit) - static_cast<long long>(ctrl);
+				double    pos[3] = {}, want[3] = {};
+				bool      have = SafeRead(pos, p, 24) && player::Pos(hit, want);
+				bool      near_ = have && std::hypot(pos[0] - want[0], pos[2] - want[2]) < 0.3 && std::fabs(pos[1] - want[1]) < 2.0;
+				if (have && ((rel >= 0 && rel < 0x2000) || near_)) {
+					for (int i = 0; i < 3; ++i) g_off[i] = pos[i] - want[i];
 					g_ctrl = ctrl;
 					g_ctrlFor = hit;
-					g_yOff = pos[1] - want[1];
-					Log("puppet: Dylan's entity found: controller %p, position at [ctrl+0x10] = %p (%.3f %.3f %.3f, %+.3f m above the hit-report copy); "
-						"hit report %p = ctrl%+lld, position ptr - hit report %+lld",
-						reinterpret_cast<void*>(ctrl), reinterpret_cast<void*>(p), pos[0], pos[1], pos[2], g_yOff, reinterpret_cast<void*>(hit),
-						static_cast<long long>(hit) - static_cast<long long>(ctrl), static_cast<long long>(p) - static_cast<long long>(hit));
+					Log("puppet: Dylan's entity found (%s): controller %p, hit report = ctrl%+lld; [ctrl+0x10] = %p holds %.3f %.3f %.3f, "
+						"hit-report copy %.3f %.3f %.3f, offset %+.3f %+.3f %+.3f",
+						near_ ? "position match" : "hit report inside controller", reinterpret_cast<void*>(ctrl), rel, reinterpret_cast<void*>(p), pos[0], pos[1],
+						pos[2], want[0], want[1], want[2], g_off[0], g_off[1], g_off[2]);
+				} else {
+					Sample& sm = g_samples[g_sampleN.fetch_add(1) % 16];
+					sm.ctrl = ctrl;
+					sm.p = p;
+					SafeRead(sm.v, p, 32);
 				}
 			}
 			if (ctrl == g_ctrl.load() && (g_on.load() || g_tpPending)) {
 				double cur[3], target[3];
 				bool   write = false;
 				if (SafeRead(cur, p, 24)) {
-					cur[1] -= g_yOff;
+					for (int i = 0; i < 3; ++i) cur[i] -= g_off[i];
 					AcquireSRWLockExclusive(&g_lock);
 					write = TargetLocked(cur, target);
 					ReleaseSRWLockExclusive(&g_lock);
 				}
-				if (write) {  // target is in hit-report (feet) space; [ctrl+0x10] sits g_yOff higher
-					double atCtrl[3] = { target[0], target[1] + g_yOff, target[2] };
+				if (write) {  // target is in hit-report (feet) space; [ctrl+0x10] sits g_off from it
+					double atCtrl[3] = { target[0] + g_off[0], target[1] + g_off[1], target[2] + g_off[2] };
 					WriteRaw(p, atCtrl);
 					WriteRaw(hit + player::kPosOff, target);
 					WriteRaw(hit + player::kPrevOff, target);
@@ -230,6 +248,18 @@ namespace cb::puppet
 	inline void Summary()
 	{
 		if (!g_applyOrig) return;
+		if (!g_ctrl.load() && g_sampleN.load()) {
+			uintptr_t hit = player::g_obj.load();
+			double    want[3] = {};
+			player::Pos(hit, want);
+			Log("puppet: Dylan's entity not found yet; hit report %p at %.2f %.2f %.2f; recent entities:", reinterpret_cast<void*>(hit), want[0], want[1],
+				want[2]);
+			for (int i = 0; i < 16 && i < static_cast<int>(g_sampleN.load()); ++i) {
+				const Sample& sm = g_samples[i];
+				Log("    ctrl %p (hit - ctrl %+lld) [ctrl+0x10] %p: %.3f %.3f %.3f %.3f", reinterpret_cast<void*>(sm.ctrl),
+					static_cast<long long>(hit) - static_cast<long long>(sm.ctrl), reinterpret_cast<void*>(sm.p), sm.v[0], sm.v[1], sm.v[2], sm.v[3]);
+			}
+		}
 		Log("puppet: %s; entity calls %llu, Dylan's entity %s, writes %llu, refused (Jesse fell) %llu; last target %.2f %.2f %.2f",
 			g_on.load() ? "ON" : "off", static_cast<unsigned long long>(g_calls.load()), g_ctrl.load() ? "known" : "not yet",
 			static_cast<unsigned long long>(g_writes.load()), static_cast<unsigned long long>(g_refused.load()), g_lastTarget[0], g_lastTarget[1],
