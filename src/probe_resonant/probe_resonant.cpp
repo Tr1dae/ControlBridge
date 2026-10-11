@@ -13,6 +13,7 @@
 #include "../common/probe.h"
 #include "../common/wwise.h"
 #include "player.h"
+#include "puppet.h"
 
 using namespace cb;
 
@@ -61,14 +62,15 @@ namespace
 			{ 0x2825130, "cameramixer::camera_update" },
 		};
 		if (Nt(exe)->FileHeader.TimeDateStamp == 0x6ac4318a) {
-			for (int i = 0; i < 3; ++i) {
+			puppet::Install(reinterpret_cast<void*>(g_exe + kSys25767184[0].rva));  // applyControllerToTransform drives Dylan
+			for (int i = 1; i < 3; ++i) {
 				void* t = reinterpret_cast<void*>(g_exe + kSys25767184[i].rva);
 				ObsSlot& o = g_obs[i];
 				strncpy_s(o.name, kSys25767184[i].name, _TRUNCATE);
 				if (Hook(t, kObsDetours[i], reinterpret_cast<void**>(&g_obsOrig[i]), o.name)) o.target = t;
 			}
 		} else {
-			Log("exe build differs from the ECS map (PE timestamp %08lx): system observers off", Nt(exe)->FileHeader.TimeDateStamp);
+			Log("exe build differs from the ECS map (PE timestamp %08lx): system observers and puppet mode off", Nt(exe)->FileHeader.TimeDateStamp);
 		}
 		player::Init(exe);
 		bridge::Open(true);
@@ -77,11 +79,14 @@ namespace
 		g_game.summary = [] {
 			player::Summary();
 			bridge::Summary();
+			puppet::Summary();
 		};
 		g_game.workerTick = [] {
 			wwise::autorecon::Tick();
 			player::Tick();
+			puppet::Tick();
 		};
+		g_game.command = puppet::Command;
 		Run();
 		return 0;
 	}
