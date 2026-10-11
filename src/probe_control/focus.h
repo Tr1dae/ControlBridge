@@ -9,6 +9,11 @@
 //   3. A game that thinks it has focus clips and re-centres the cursor: ClipCursor and SetCursorPos
 //      are ignored while Control isn't really the foreground window, so it can't take the mouse
 //      from Resonant.
+//   4. Control reads mouse buttons with GetAsyncKeyState, which sees global state (test 8: desktop and
+//      Resonant clicks fired Jesse's weapon and flipped Control to keyboard+mouse, after which it
+//      ignored the gamepad). While it isn't really in front, GetAsyncKeyState / GetKeyState /
+//      GetKeyboardState report nothing pressed, and raw-input registrations lose their background
+//      (INPUTSINK) flags. The virtual pad is then its only input.
 #pragma once
 
 #include "../common/probe.h"
@@ -21,12 +26,17 @@ namespace cb::focus
 
 	inline bool Force() { return g_fake; }
 
-	inline bool ReallyForeground()
+	inline bool QueryForeground()
 	{
 		DWORD pid = 0;
 		GetWindowThreadProcessId(GetForegroundWindow(), &pid);
 		return pid == GetCurrentProcessId();
 	}
+
+	// Refreshed every 10 ms by Tick (key-state calls come hundreds of times per frame).
+	inline std::atomic<bool> g_fg{ true };
+	inline bool              ReallyForeground() { return g_fg.load(std::memory_order_relaxed); }
+	inline bool              Muted() { return g_fake && !ReallyForeground(); }
 
 	// ---- 1. app events ------------------------------------------------------------------------
 	// app::Event starts with an int type; app::EventHandler::dispatchAppEvent switches on it (24 types).
@@ -88,9 +98,54 @@ namespace cb::focus
 		return g_setPosOrig(a_x, a_y);
 	}
 
+	// ---- 4. keyboard / mouse state while in the background ---------------------------------------------
+	using GetAsyncKeyStateFn = SHORT(WINAPI*)(int);
+	using GetKeyboardStateFn = BOOL(WINAPI*)(PBYTE);
+	using RegisterRawFn = BOOL(WINAPI*)(PCRAWINPUTDEVICE, UINT, UINT);
+	inline GetAsyncKeyStateFn    g_asyncOrig = nullptr, g_keyStateOrig = nullptr;
+	inline GetKeyboardStateFn    g_kbStateOrig = nullptr;
+	inline RegisterRawFn         g_rawRegOrig = nullptr;
+	inline std::atomic<uint64_t> g_keysMuted{ 0 };
+
+	inline SHORT WINAPI GetAsyncKeyStateDetour(int a_vk)
+	{
+		if (Muted()) {
+			g_keysMuted.fetch_add(1, std::memory_order_relaxed);
+			return 0;
+		}
+		return g_asyncOrig(a_vk);
+	}
+
+	inline SHORT WINAPI GetKeyStateDetour(int a_vk)
+	{
+		if (Muted()) return 0;
+		return g_keyStateOrig(a_vk);
+	}
+
+	inline BOOL WINAPI GetKeyboardStateDetour(PBYTE a_keys)
+	{
+		if (Muted() && a_keys) {
+			memset(a_keys, 0, 256);
+			return TRUE;
+		}
+		return g_kbStateOrig(a_keys);
+	}
+
+	inline BOOL WINAPI RegisterRawDetour(PCRAWINPUTDEVICE a_devs, UINT a_n, UINT a_size)
+	{
+		std::vector<RAWINPUTDEVICE> d(a_devs, a_devs + (a_devs ? a_n : 0));
+		for (auto& r : d) {
+			Log("focus: RegisterRawInputDevices usage %02x/%02x flags %08lx hwnd %p%s", r.usUsagePage, r.usUsage, r.dwFlags, r.hwndTarget,
+				g_fake && (r.dwFlags & (RIDEV_INPUTSINK | RIDEV_EXINPUTSINK)) ? " -> background flags removed" : "");
+			if (g_fake) r.dwFlags &= ~(RIDEV_INPUTSINK | RIDEV_EXINPUTSINK);
+		}
+		return g_rawRegOrig(d.empty() ? a_devs : d.data(), a_n, a_size);
+	}
+
 	// ---- 2. hold the window's flags (worker tick) ---------------------------------------------------
 	inline void Tick()
 	{
+		g_fg = QueryForeground();
 		uintptr_t w = g_window.load();
 		if (!g_fake || !w) return;
 		uint8_t f[2];
@@ -105,8 +160,9 @@ namespace cb::focus
 	inline void Summary()
 	{
 		if (!g_fake) return;
-		Log("focus: faking (really foreground: %s); focus events swallowed %llu, cursor calls blocked %llu", ReallyForeground() ? "yes" : "no",
-			static_cast<unsigned long long>(g_swallowed.load()), static_cast<unsigned long long>(g_cursorBlocked.load()));
+		Log("focus: faking (really foreground: %s); focus events swallowed %llu, cursor calls blocked %llu, key reads muted %llu",
+			ReallyForeground() ? "yes" : "no", static_cast<unsigned long long>(g_swallowed.load()),
+			static_cast<unsigned long long>(g_cursorBlocked.load()), static_cast<unsigned long long>(g_keysMuted.load()));
 	}
 
 	inline void Install(HMODULE a_core)
@@ -122,5 +178,13 @@ namespace cb::focus
 			reinterpret_cast<void**>(&g_clipOrig), "user32!ClipCursor");
 		Hook(reinterpret_cast<void*>(GetProcAddress(u, "SetCursorPos")), reinterpret_cast<void*>(&SetCursorPosDetour),
 			reinterpret_cast<void**>(&g_setPosOrig), "user32!SetCursorPos");
+		Hook(reinterpret_cast<void*>(GetProcAddress(u, "GetAsyncKeyState")), reinterpret_cast<void*>(&GetAsyncKeyStateDetour),
+			reinterpret_cast<void**>(&g_asyncOrig), "user32!GetAsyncKeyState");
+		Hook(reinterpret_cast<void*>(GetProcAddress(u, "GetKeyState")), reinterpret_cast<void*>(&GetKeyStateDetour),
+			reinterpret_cast<void**>(&g_keyStateOrig), "user32!GetKeyState");
+		Hook(reinterpret_cast<void*>(GetProcAddress(u, "GetKeyboardState")), reinterpret_cast<void*>(&GetKeyboardStateDetour),
+			reinterpret_cast<void**>(&g_kbStateOrig), "user32!GetKeyboardState");
+		Hook(reinterpret_cast<void*>(GetProcAddress(u, "RegisterRawInputDevices")), reinterpret_cast<void*>(&RegisterRawDetour),
+			reinterpret_cast<void**>(&g_rawRegOrig), "user32!RegisterRawInputDevices");
 	}
 }

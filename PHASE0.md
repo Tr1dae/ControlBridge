@@ -315,6 +315,21 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
 - A game restart overwrote the log of the session that mattered. The probe now keeps the previous one
   as `<tag>_probe.prev.log`.
 
+## In-game test 8 (2026-10-11): pad ignored after alt-tab
+
+- With the focus-gained fix, the controller works in Control again. On alt-tab, Control switched to
+  keyboard+mouse: desktop clicks and Resonant's mouse buttons fired Jesse's weapon (WASD didn't), and
+  then gamepad input was ignored.
+- The virtual pad *was* served about 300 times/s while Resonant was in front, so Control polled XInput
+  but its input layer stayed on keyboard+mouse.
+- Cause: Control reads keys and mouse buttons with `GetAsyncKeyState` (app_rmdwin10_f and
+  input_rmdwin10_f import it), which sees global state. Keyboard keys come through window messages,
+  which only reach the foreground window, hence clicks but no WASD.
+- Fix (focus.h, FakeFocus=1): while Control isn't really in front, `GetAsyncKeyState`,
+  `GetKeyState` and `GetKeyboardState` report nothing pressed, and `RegisterRawInputDevices` loses
+  `RIDEV_INPUTSINK` / `RIDEV_EXINPUTSINK` (registrations are logged). The foreground state is cached
+  every 10 ms.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
