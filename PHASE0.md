@@ -424,6 +424,19 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
   - The 30 Hz path only checks that the found entity still follows Dylan's controller (else it
     rescans) and teleports while puppet mode is on.
 
+## In-game test 15 (2026-10-11): teleporting a child entity
+
+- The scan works off the game thread (4.6 s, no freeze) and matched to 2 mm. The puppet ran about 30
+  teleports/s, 0 failures, but Dylan didn't move.
+- At least five entities share Dylan's exact transform (his attached children). The first was a
+  child, and a child's world transform is recomputed from its parent.
+- **ECS component type ids are FNV-1a 32 of the full type name**:
+  `coregame::component::Teleported` = 0xc55ae319, `coregame::component::WorldTransformReadOnly` =
+  0x6cfbb2a9. So any component can be tested by name.
+- Fix: among the entities at Dylan's position, pick the one whose archetype has
+  `coregame::component::CharacterController` (then `Player`, `ActiveAvatar`); each candidate's
+  component flags are logged.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`

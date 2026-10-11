@@ -152,7 +152,19 @@ namespace cb::puppet
 	// the game's own lookup (exe+1a480b0) fatal-errors on a free slot, and the scan runs on another
 	// thread while entities come and go. exe+32ced90 is a plain linear search over u32 column hashes.
 	inline constexpr uint32_t kSetWorldRva = 0x1838400;
-	inline constexpr uint32_t kTransformHash = 0x6cfbb2a9, kTeleportedHash = 0xc55ae319;
+	// Component type ids are FNV-1a 32 of the full name (checked: Teleported, WorldTransformReadOnly).
+	constexpr uint32_t Fnv1a(const char* a_s)
+	{
+		uint32_t h = 0x811c9dc5;
+		for (; *a_s; ++a_s) h = (h ^ static_cast<uint8_t>(*a_s)) * 0x01000193u;
+		return h;
+	}
+	inline constexpr uint32_t kTransformHash = Fnv1a("coregame::component::WorldTransformReadOnly");
+	inline constexpr uint32_t kTeleportedHash = Fnv1a("coregame::component::Teleported");
+	inline constexpr uint32_t kCharacterControllerHash = Fnv1a("coregame::component::CharacterController");
+	inline constexpr uint32_t kPlayerHash = Fnv1a("coregame::component::Player");
+	inline constexpr uint32_t kActiveAvatarHash = Fnv1a("coregame::component::ActiveAvatar");
+	static_assert(kTransformHash == 0x6cfbb2a9 && kTeleportedHash == 0xc55ae319);
 	using SetWorldFn = void (*)(const uintptr_t*, uint64_t, const void*, uint8_t);
 	inline SetWorldFn g_setWorld = nullptr;
 
@@ -295,10 +307,10 @@ namespace cb::puppet
 			XfPos(x.raw, p);
 			if (std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]))
 				x.d = std::hypot(p[0] - want[0], p[2] - want[2]) + 0.1 * std::fabs(p[1] - want[1]);
-			if (c.size() < 8 || x.d < c.back().d) {  // keep the 8 nearest
+			if (c.size() < 32 || x.d < c.back().d) {  // keep the 32 nearest (the character and its attached children)
 				c.push_back(x);
 				std::sort(c.begin(), c.end(), [](const Cand& a, const Cand& b) { return a.d < b.d; });
-				if (c.size() > 8) c.pop_back();
+				if (c.size() > 32) c.pop_back();
 			}
 		}
 		Log("puppet: entity scan (%.0f ms): %zu table entries, %u live; Dylan's controller at %.2f %.2f %.2f; nearest transforms:", (Now() - t0) * 1000.0,
@@ -308,16 +320,34 @@ namespace cb::puppet
 			memcpy(f, c[i].raw, 32);
 			Log("    entity %u: %.3f m | rot %.3f %.3f %.3f %.3f | pos %.3f %.3f %.3f", c[i].idx, c[i].d, f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
 		}
-		if (!c.empty() && c[0].d < 0.5) {
+		// Test 15: several entities share Dylan's exact transform (his attached children); teleporting one
+		// of those moved nothing. Pick the one that owns the character controller (then Player).
+		const Cand* pick = nullptr;
+		int         pickScore = -1;
+		for (const Cand& x : c) {
+			if (x.d >= 0.5) break;
+			uint16_t arch;
+			uint32_t row, cols = 0;
+			if (!Entry(world, x.idx, arch, row)) continue;
+			Read(world + (uintptr_t(arch) + 0xc22) * 32 + 0x24, cols);
+			bool cc = FindCol(world, arch, kCharacterControllerHash) >= 0, pl = FindCol(world, arch, kPlayerHash) >= 0,
+			     av = FindCol(world, arch, kActiveAvatarHash) >= 0;
+			Log("    candidate %u: %u components%s%s%s", x.idx, cols, cc ? ", CharacterController" : "", pl ? ", Player" : "", av ? ", ActiveAvatar" : "");
+			int score = (cc ? 4 : 0) + (pl ? 2 : 0) + (av ? 1 : 0);
+			if (score > pickScore) pickScore = score, pick = &x;
+		}
+		if (pick && pickScore > 0) {
 			double p[3];
-			XfPos(c[0].raw, p);
+			XfPos(pick->raw, p);
 			AcquireSRWLockExclusive(&g_lock);
 			for (int i = 0; i < 3; ++i) g_posOff[i] = p[i] - want[i];
-			g_entity = c[0].idx;
+			g_entity = pick->idx;
 			g_entityFor = hit;
 			g_offWorld = 0;
 			ReleaseSRWLockExclusive(&g_lock);
-			Log("puppet: Dylan = entity %u (transform %+.3f %+.3f %+.3f from the controller copy)", c[0].idx, g_posOff[0], g_posOff[1], g_posOff[2]);
+			Log("puppet: Dylan = entity %u (transform %+.3f %+.3f %+.3f from the controller copy)", pick->idx, g_posOff[0], g_posOff[1], g_posOff[2]);
+		} else if (pick) {
+			Log("puppet: entities at Dylan's position, but none with CharacterController / Player / ActiveAvatar: not choosing");
 		}
 	}
 
