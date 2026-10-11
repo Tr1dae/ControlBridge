@@ -44,7 +44,7 @@ function Place($src, $dest) {
 
 function Ini($dest) {
 	$tmp = Join-Path $env:TEMP "controlbridge.ini"
-	@("[ControlBridge]", "LogDir=$LogDir", "FrameCsv=1", "FrameCsvEvery=1", "FrameCsvMinutes=20") | Set-Content -Encoding ASCII $tmp
+	@("[ControlBridge]", "LogDir=$LogDir", "FrameCsv=1", "FrameCsvEvery=1", "FrameCsvMinutes=20", "AutoRecon=1") | Set-Content -Encoding ASCII $tmp
 	Place $tmp $dest
 	Remove-Item $tmp
 }

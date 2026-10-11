@@ -205,7 +205,7 @@ namespace cb::wwise
 	};
 
 	// Emitters updated in the last a_maxAge seconds, nearest to a_ref first.
-	inline std::vector<Near> Nearest(const double* a_ref, size_t a_n, double a_maxAge)
+	inline std::vector<Near> Nearest(const double* a_ref, size_t a_n, double a_maxAge, double a_minDist = 0.05)
 	{
 		std::vector<Near> v;
 		double            now = Now();
@@ -213,7 +213,9 @@ namespace cb::wwise
 		for (auto& o : g_objs) {
 			Xf x;
 			if (!o.used || o.removed || now - o.t > a_maxAge || IsListener(o.id) || Decode(o.raw, g_double, x) < 0) continue;
-			v.push_back({ o.id, Dist(x.pos, a_ref), o.count, x });
+			double dist = Dist(x.pos, a_ref);
+			if (dist < a_minDist) continue;  // emitters riding on the camera/listener itself
+			v.push_back({ o.id, dist, o.count, x });
 		}
 		ReleaseSRWLockShared(&g_lock);
 		std::sort(v.begin(), v.end(), [](const Near& a, const Near& b) { return a.dist < b.dist; });
@@ -293,12 +295,16 @@ namespace cb::wwise
 		inline uintptr_t              g_viewVt = 0;
 		inline uint32_t               g_matOff = 0x70, g_fovOff = 0x2E0;
 
+		inline void WatchBest(uintptr_t a_at);
+
 		inline void Find(size_t a_max)
 		{
 			if (g_vts.empty() && g_mod) g_vts = FindVtables(g_mod, "PerspectiveView@m");
 			Xf     lis{};
 			bool   haveLis = Get(ListenerId(), lis);
 			Log("views: %zu vtable(s) of m::PerspectiveView; listener %s", g_vts.size(), haveLis ? "known" : "unknown");
+			uintptr_t bestAt = 0;
+			double    bestD = 0.5;
 			for (uintptr_t vt : g_vts) {
 				auto inst = ScanHeap(vt, a_max);
 				Log("  vtable %s: %zu instance(s)", Rva(vt).c_str(), inst.size());
@@ -316,7 +322,10 @@ namespace cb::wwise
 					for (uint32_t o = 0; o + 24 <= sizeof(b); o += 8) {
 						double d[3];
 						memcpy(d, b + o, 24);
-						if (std::isfinite(d[0]) && Dist(d, lis.pos) < 0.5) Log("      listener pos as doubles at +%x (%.3f m)", o, Dist(d, lis.pos));
+						if (std::isfinite(d[0]) && Dist(d, lis.pos) < 0.5) {
+							Log("      listener pos as doubles at +%x (%.3f m)", o, Dist(d, lis.pos));
+							if (Dist(d, lis.pos) < bestD) bestD = Dist(d, lis.pos), bestAt = p + o;
+						}
 					}
 					for (uint32_t o = 0; o + 12 <= sizeof(b); o += 4) {
 						float  f[3];
@@ -326,6 +335,16 @@ namespace cb::wwise
 					}
 				}
 			}
+			WatchBest(bestAt);
+		}
+
+		inline void WatchBest(uintptr_t a_at)
+		{
+			if (!a_at) return;
+			AcquireSRWLockExclusive(&g_watchLock);
+			g_watch[3] = { a_at, true };
+			ReleaseSRWLockExclusive(&g_watchLock);
+			Log("views: best listener match %p (%s) -> CSV w9..w11", reinterpret_cast<void*>(a_at), Rva(a_at).c_str());
 		}
 
 		inline void Fill(Row& a_r)
@@ -339,6 +358,154 @@ namespace cb::wwise
 				return;
 			}
 			if (SafeRead(a_r.cam, p + g_matOff, sizeof(a_r.cam)) && Read(p + g_fovOff, a_r.fov)) a_r.flags |= kRowCam;
+		}
+	}
+
+	// ---- autofind: where does the game keep the player's position? ----------------------------------
+	// 'autofind [emitter id | listener] [box]':
+	//   1. snapshot every double/float triple within `box` m of a reference object (default: nearest
+	//      emitter that isn't on the camera, i.e. something on the player)
+	//   2. wait until the reference moved > 3 m and stood still for 0.75 s
+	//   3. keep candidates that moved by the same delta (25 cm per axis), so bone offsets don't matter
+	//   4. repeat once more, then log the survivors and watch the first four (CSV w0..w11)
+	namespace autofind
+	{
+		enum State
+		{
+			kIdle,
+			kWaitMove,
+			kWaitStop
+		};
+		inline State             g_state = kIdle;
+		inline uint64_t          g_ref = 0;
+		inline double            g_from[3], g_last[3], g_still = 0;
+		inline int               g_round = 0;
+		inline std::vector<Cand> g_c;
+
+		inline bool RefPos(double* a_out)
+		{
+			Xf x;
+			if (!Get(g_ref, x)) return false;
+			memcpy(a_out, x.pos, 24);
+			return true;
+		}
+
+		inline void Finish(const char* a_why)
+		{
+			Log("autofind: %s, %zu candidate(s)", a_why, g_c.size());
+			std::vector<double>  v;
+			std::vector<uint8_t> ok;
+			ReadMany(g_c, v, ok);
+			for (size_t i = 0; i < g_c.size() && i < 32; ++i) {
+				Log("  [%zu] %p %s now %.4f %.4f %.4f", i, reinterpret_cast<void*>(g_c[i].addr), g_c[i].dbl ? "d" : "f", v[i * 3], v[i * 3 + 1],
+					v[i * 3 + 2]);
+			}
+			AcquireSRWLockExclusive(&g_watchLock);
+			for (int w = 0; w < 3; ++w) g_watch[w] = w < static_cast<int>(g_c.size()) ? Watch{ g_c[w].addr, g_c[w].dbl } : Watch{};
+			ReleaseSRWLockExclusive(&g_watchLock);
+			if (!g_c.empty()) Log("autofind: watching the first %zu in CSV w0..w8; 'cands' lists them all", std::min<size_t>(3, g_c.size()));
+			g_cands = g_c;
+			g_state = kIdle;
+		}
+
+		inline void Filter(const double* a_now)
+		{
+			double d[3] = { a_now[0] - g_from[0], a_now[1] - g_from[1], a_now[2] - g_from[2] };
+			std::vector<double>  v;
+			std::vector<uint8_t> ok;
+			ReadMany(g_c, v, ok);
+			std::vector<Cand> keep;
+			for (size_t i = 0; i < g_c.size(); ++i) {
+				const double* n = &v[i * 3];
+				const double* f = g_c[i].first;
+				if (ok[i] && std::fabs(n[0] - f[0] - d[0]) < 0.25 && std::fabs(n[1] - f[1] - d[1]) < 0.25 && std::fabs(n[2] - f[2] - d[2]) < 0.25) {
+					Cand c = g_c[i];
+					memcpy(c.first, n, 24);
+					keep.push_back(c);
+				}
+			}
+			Log("autofind round %d: reference moved %.2f %.2f %.2f; %zu of %zu candidates moved the same way", g_round + 1, d[0], d[1], d[2],
+				keep.size(), g_c.size());
+			g_c.swap(keep);
+			memcpy(g_from, a_now, 24);
+			if (++g_round >= 2 || g_c.size() <= 8) {
+				Finish(g_c.empty() ? "nothing followed the reference" : "done");
+			} else {
+				g_state = kWaitMove;
+				Log("autofind: move the player again (> 3 m) and stop");
+			}
+		}
+
+		inline void Start(uint64_t a_ref, double a_box)
+		{
+			g_ref = a_ref;
+			if (!RefPos(g_from)) {
+				Log("autofind: reference %llu has no position", static_cast<unsigned long long>(a_ref));
+				return;
+			}
+			double t0 = Now();
+			g_c = FindTriple(g_from, a_box, true, 4000000);
+			size_t nd = g_c.size();
+			auto   f = FindTriple(g_from, a_box, false, 4000000);
+			g_c.insert(g_c.end(), f.begin(), f.end());
+			Log("autofind: reference %llu at %.3f %.3f %.3f, box %.2f m: %zu double + %zu float candidates (%.1f s). "
+				"Now move the player > 3 m and stop.",
+				static_cast<unsigned long long>(a_ref), g_from[0], g_from[1], g_from[2], a_box, nd, f.size(), Now() - t0);
+			g_round = 0;
+			g_state = kWaitMove;
+		}
+
+		inline void Tick()
+		{
+			if (g_state == kIdle) return;
+			double p[3];
+			if (!RefPos(p)) return;
+			if (g_state == kWaitMove) {
+				if (Dist(p, g_from) > 3.0) {
+					g_state = kWaitStop;
+					memcpy(g_last, p, 24);
+					g_still = Now();
+				}
+			} else if (Dist(p, g_last) > 0.02) {
+				memcpy(g_last, p, 24);
+				g_still = Now();
+			} else if (Now() - g_still > 0.75) {
+				Filter(p);
+			}
+		}
+	}
+
+	// ---- auto recon (AutoRecon=1 in controlbridge.ini) ---------------------------------------------
+	// Once per session: when the listener has existed for 10 s and stood still for 3 s, run 'views'
+	// and 'autofind' on their own, so a test only needs the player to walk and stop twice.
+	namespace autorecon
+	{
+		inline bool   g_on = false, g_done = false;
+		inline double g_firstSeen = 0, g_still = 0, g_last[3] = {};
+
+		inline void Tick()
+		{
+			autofind::Tick();
+			if (!g_on || g_done) return;
+			Xf lis;
+			if (!Get(ListenerId(), lis)) return;
+			double now = Now();
+			if (!g_firstSeen) g_firstSeen = now;
+			if (Dist(lis.pos, g_last) > 0.05) {
+				memcpy(g_last, lis.pos, 24);
+				g_still = now;
+				return;
+			}
+			if (now - g_firstSeen < 10.0 || now - g_still < 3.0) return;
+			g_done = true;
+			Log("auto recon: player standing still, searching camera views and the player's position");
+			views::Find(64);
+			auto n = Nearest(lis.pos, 1, 0.5);
+			if (n.empty()) {
+				Log("auto recon: no emitter near the camera, autofind skipped");
+				return;
+			}
+			autofind::Start(n[0].id, 2.0);
 		}
 	}
 
@@ -438,6 +605,22 @@ namespace cb::wwise
 			}
 			Log("findnear: object %llu", static_cast<unsigned long long>(id));
 			FindAndLog(x.pos, argc > 2 ? atof(argv[2]) : 0.05, 4096);
+		} else if (!_stricmp(c, "autofind")) {  // autofind [emitter id | listener] [box m]
+			uint64_t ref = 0;
+			Xf       lis;
+			if (argc > 1 && !_stricmp(argv[1], "listener")) {
+				ref = ListenerId();
+			} else if (argc > 1 && strtoull(argv[1], nullptr, 10)) {
+				ref = strtoull(argv[1], nullptr, 10);
+			} else if (Get(ListenerId(), lis)) {
+				auto n = Nearest(lis.pos, 1, 0.5);
+				if (!n.empty()) ref = n[0].id;
+			}
+			if (!ref) {
+				Log("autofind: no reference object yet");
+				return true;
+			}
+			autofind::Start(ref, argc > 2 ? atof(argv[2]) : 2.0);
 		} else if (!_stricmp(c, "views")) {  // views [max]
 			views::Find(argc > 1 ? strtoull(argv[1], nullptr, 10) : 32);
 		} else if (!_stricmp(c, "view") && argc > 1) {  // view <addr>|off [matOff] [fovOff]
@@ -478,5 +661,8 @@ namespace cb::wwise
 		g_game.fillCommon = FillCommon;
 		g_game.summaryCommon = SummaryCommon;
 		g_game.commandCommon = CommandCommon;
+		g_game.workerTick = autorecon::Tick;
+		autorecon::g_on = IniInt(L"AutoRecon", 0) != 0;
+		Log("auto recon %s", autorecon::g_on ? "on: stand still after loading, then walk > 3 m and stop, twice" : "off");
 	}
 }

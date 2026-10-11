@@ -134,6 +134,45 @@ named module.
   `LocalTransformReadOnly`, `Teleported`, `ActiveAvatar`, `Player`, `CameraView`, `FreeCameraTransform`,
   `InterpolatedTransform`.
 
+## In-game test 1 (2026-10-11): passive probes in both games, no crashes
+
+Controller session in each game: stand, stick forward, stick right, jump, camera turn. Control also had
+an alt-tab. Analysis: `tools/analyze_frames.py` plus the camera-turn check.
+
+**Coordinate systems: both games are left-handed, Y up, meters.**
+- Up: Control jump +0.83 m on Y; Resonant camera rises 1.8 to 1.95 m on Y when Dylan jumps.
+- Units: Jesse jogs about 4.4 m/s; Dylan runs about 5.8 m/s.
+- Handedness:
+  - Control: stick right moved Jesse along camera-right = (forward × up) · right = −0.99.
+  - Both games: turning the camera right swings forward toward up × forward, in every sample
+    (5 in Control, 7 in Resonant). So right = up × forward: X right, Y up, Z forward, as in D3D.
+- The cross-game mapping is therefore a translation (plus a yaw if we re-anchor). No basis change.
+
+**Control (2019)**
+- Jesse's transform: `EntityState::getTransform` returns 4 rows of 3 floats. Rows 0-2 are rotation;
+  translation is `p9..p11`. `getAvatarObject` is called about 160 times/s on thread 14432 (not the
+  main thread). The entity is a `GenericEntityState`.
+- `CameraComponentState::updateViewFromTransform` is **not** the gameplay camera: 19+ camera states,
+  each updated only about 3 times, at positions far from Jesse. The gameplay camera must come from
+  elsewhere; `views` (m::PerspectiveView matched to the listener) is the next try.
+- Wwise:
+  - listener id 4294967299 = the camera: 4 m behind and 2 m above Jesse; front matches the view
+  - emitter 4294967297 rides on the listener
+  - Jesse's emitters about 3 m from the camera
+- Frame tick (RenderAudio) runs on the main thread at about 120 to 190 fps.
+- **Alt-tab:** only `GameWindow::hasFocus` changed (1 -> 0 -> 1). No `setGamePaused`, no
+  `InputManager::setFocus` call, and **the game kept running at about 152 frames/s in the
+  background**. Faking focus may only be needed for input.
+
+**CONTROL Resonant**
+- Wwise: same listener id 4294967299 (shared Remedy audio code). Layout 3:
+  `{front, top, double position}`. Emitter 4294967297 rides on the camera.
+- Dylan's body emitters form a cluster about 4.5 m from the camera (ids like 252/253/254, stacked
+  0.2 to 0.5 m apart in Y).
+- RenderAudio about 130 to 175 fps on one thread. SetPosition peaks at about 1,600/s in busy areas.
+- Dylan's own transform and the camera view are still unknown. The probe's `autofind` (delta-matching
+  memory search seeded from his emitter) and `views` now run automatically (`AutoRecon=1`).
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`

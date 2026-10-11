@@ -224,7 +224,42 @@ int main()
 	CHECK(g_obs[2].target == nullptr);
 	CHECK(FakeSystem(1, 1) == 2 && g_obs[2].calls.load() == 3);  // unhooked: still works, no longer counted
 
+	// ---- autofind: a "player root" 1.5 m below an emitter follows it; decoys don't ----
+	{
+		auto*  root = new double[3]{ 300.0, 8.5, 70.0 };
+		auto*  stay = new double[3]{ 300.5, 9.0, 70.5 };  // inside the box, never moves
+		auto*  wrong = new double[3]{ 299.5, 9.5, 69.5 }; // moves, but the other way
+		float  emi[9] = { 0, 0, 1, 0, 1, 0, 300.0f, 10.0f, 70.0f };
+		FakeSetPosition(900, emi);
+		autofind::Start(900, 2.0);
+		CHECK(autofind::g_state == autofind::kWaitMove && !autofind::g_c.empty());
+		for (int round = 0; round < 2; ++round) {
+			emi[6] += 5.0f;
+			root[0] += 5.0;
+			wrong[0] -= 5.0;
+			FakeSetPosition(900, emi);
+			for (int i = 0; i < 120 && autofind::g_state != autofind::kIdle; ++i) {
+				autofind::Tick();
+				if (autofind::g_round > round) break;
+				Sleep(10);
+			}
+		}
+		CHECK(autofind::g_state == autofind::kIdle);
+		bool hasRoot = false, hasDecoy = false;
+		for (auto& c : g_cands) {
+			hasRoot |= c.addr == reinterpret_cast<uintptr_t>(root);
+			hasDecoy |= c.addr == reinterpret_cast<uintptr_t>(stay) || c.addr == reinterpret_cast<uintptr_t>(wrong);
+		}
+		CHECK(hasRoot && !hasDecoy);
+		Row ra{};
+		FillRow(ra, 0);
+		bool watched = false;
+		for (int w = 0; w < 4; ++w) watched |= ra.watch[3 * w] == 310.0 && ra.watch[3 * w + 1] == 8.5;
+		CHECK(watched);
+	}
+
 	std::string log = ReadAll(Path(L"selftest_probe.log"));
+	CHECK(log.find("autofind round 2") != std::string::npos || log.find("autofind: done") != std::string::npos);
 	CHECK(log.find("obs 2 fake_system") != std::string::npos);
 	CHECK(log.find("keep moved: 1 of") != std::string::npos);
 	CHECK(log.find("rtti") != std::string::npos && log.find("'PerspectiveView@m'") != std::string::npos);

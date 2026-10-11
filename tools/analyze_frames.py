@@ -80,7 +80,8 @@ def analyze(path):
     fwd = segments((ly > STICK) & (np.abs(lx) < CALM), t)
     right = segments((lx > STICK) & (np.abs(ly) < CALM), t)
     turn = segments((rx > STICK) & (np.abs(lx) < CALM) & (np.abs(ly) < CALM), t)
-    jumps = [i for i in range(1, len(btn)) if (btn[i] & 0x1000) and not (btn[i - 1] & 0x1000)]
+    live = (col(head, d, "flags").astype(int) & 5) > 0
+    jumps = [i for i in range(1, len(btn)) if (btn[i] & 0x1000) and not (btn[i - 1] & 0x1000) and live[i]]
     print(f"moves: {len(fwd)} forward, {len(right)} right, {len(jumps)} jump presses (A), {len(turn)} camera turns")
 
     def disp(arr, s):
@@ -96,26 +97,34 @@ def analyze(path):
                     print(f"    {label:8} {dt:4.1f}s  delta {v.round(3)}  speed {np.linalg.norm(v) / dt:6.2f}/s  dir {(v / (np.linalg.norm(v) + 1e-9)).round(2)}")
         for j in jumps[:2]:
             w = arr[j:min(len(arr), j + int(1.5 * len(t) / (t[-1] - t[0] + 1e-9)))]
-            if np.isfinite(w).all() and len(w) > 2:
+            w = w[np.isfinite(w).all(1)]
+            if len(w) > 2:
                 rise = w.max(0) - w[0]
                 print(f"    jump      rise per axis {rise.round(3)} -> up axis {'xyz'[int(np.argmax(rise))]} ({rise.max():.2f})")
-    # handedness: forward x up should point along +right in a right-handed world
+    # handedness: the listener (camera) front, flattened, is "stick forward". In a right-handed world
+    # forward x up points to the right; in a left-handed one, to the left.
+    lf = np.stack([col(head, d, k) for k in ("lis_fx", "lis_fy", "lis_fz")], 1)
     for name, arr in tri.items():
-        if not (fwd and right and jumps):
+        if not right:
             break
-        f, _ = disp(arr, fwd[0])
-        r, _ = disp(arr, right[0])
-        j = jumps[0]
-        w = arr[j:j + 60]
-        if not (np.isfinite(f).all() and np.isfinite(r).all() and np.isfinite(w).all()):
+        s0, s1 = right[0]
+        r, _ = disp(arr, (s0, s1))
+        ups = []
+        for j in jumps:
+            w = arr[j:j + int(1.5 * len(t) / (t[-1] - t[0] + 1e-9))]
+            w = w[np.isfinite(w).all(1)]
+            if len(w) > 2:
+                ups.append(int(np.argmax(w.max(0) - w[0])))
+        if not ups or not np.isfinite(r).all():
             continue
         up = np.zeros(3)
-        up[int(np.argmax(w.max(0) - w[0]))] = 1
-        f, r = f - up * f.dot(up), r - up * r.dot(up)
+        up[max(set(ups), key=ups.count)] = 1
+        f = lf[s0] - up * lf[s0].dot(up)
+        r = r - up * r.dot(up)
         if np.linalg.norm(f) < 0.1 or np.linalg.norm(r) < 0.1:
             continue
-        s = np.cross(f / np.linalg.norm(f), up).dot(r / np.linalg.norm(r))
-        print(f"  handedness from {name}: (forward x up) . right = {s:+.2f} -> {'right' if s > 0 else 'left'}-handed")
+        hs = np.cross(f / np.linalg.norm(f), up).dot(r / np.linalg.norm(r))
+        print(f"  handedness from {name} + listener front: (forward x up) . right = {hs:+.2f} -> {'right' if hs > 0 else 'left'}-handed")
     if "listener" in tri:
         lis = tri["listener"]
         for name in [k for k in tri if k.startswith("cam")]:

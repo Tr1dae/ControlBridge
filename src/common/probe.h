@@ -454,18 +454,27 @@ namespace cb
 
 	inline std::vector<Cand> FindTriple(const double* a_xyz, double a_tol, bool a_dbl, size_t a_max)
 	{
-		std::vector<Cand>    out;
+		// Results go into one private block that the scan skips: every stored candidate is itself a
+		// matching triple, so a heap-allocated, growing result array would find its own entries.
+		size_t bytes = std::max<size_t>(a_max, 1) * sizeof(Cand);
+		auto*  res = static_cast<Cand*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+		if (!res) return {};
+		size_t               n = 0;
 		std::vector<uint8_t> chunk(1 << 20);
 		const size_t         stride = a_dbl ? 8 : 4, span = 3 * stride;
 		ULONG_PTR            stackLo = 0, stackHi = 0;
 		GetCurrentThreadStackLimits(&stackLo, &stackHi);
+		auto skip = [&](uintptr_t a_at) {
+			return (a_at >= reinterpret_cast<uintptr_t>(chunk.data()) && a_at < reinterpret_cast<uintptr_t>(chunk.data()) + chunk.size()) ||
+			       (a_at >= reinterpret_cast<uintptr_t>(res) && a_at < reinterpret_cast<uintptr_t>(res) + bytes);
+		};
 		ForEachHeapRegion([&](uintptr_t a_base, size_t a_size) {
-			if (a_base >= stackLo && a_base < stackHi) return;
-			for (size_t off = 0; off < a_size && out.size() < a_max; off += chunk.size() - span) {
-				size_t n = std::min(chunk.size(), a_size - off);
-				if (n < span || !SafeCopy(chunk.data(), reinterpret_cast<const void*>(a_base + off), n)) continue;
+			if ((a_base >= stackLo && a_base < stackHi) || a_base == reinterpret_cast<uintptr_t>(res)) return;
+			for (size_t off = 0; off < a_size && n < a_max; off += chunk.size() - span) {
+				size_t len = std::min(chunk.size(), a_size - off);
+				if (len < span || !SafeCopy(chunk.data(), reinterpret_cast<const void*>(a_base + off), len)) continue;
 				const uint8_t* b = chunk.data();
-				for (size_t i = 0; i + span <= n && out.size() < a_max; i += stride) {
+				for (size_t i = 0; i + span <= len && n < a_max; i += stride) {
 					double v[3];
 					if (a_dbl) {
 						memcpy(v, b + i, 24);
@@ -476,14 +485,44 @@ namespace cb
 					}
 					if (std::fabs(v[0] - a_xyz[0]) > a_tol || std::fabs(v[1] - a_xyz[1]) > a_tol || std::fabs(v[2] - a_xyz[2]) > a_tol) continue;
 					uintptr_t at = a_base + off + i;
-					if (at >= reinterpret_cast<uintptr_t>(chunk.data()) && at < reinterpret_cast<uintptr_t>(chunk.data()) + chunk.size()) continue;
-					out.push_back({ at, a_dbl, { v[0], v[1], v[2] } });
+					if (skip(at)) continue;
+					res[n++] = { at, a_dbl, { v[0], v[1], v[2] } };
 				}
-				if (n < chunk.size()) break;
+				if (len < chunk.size()) break;
 			}
 			Sleep(0);
 		});
+		std::vector<Cand> out(res, res + n);
+		VirtualFree(res, 0, MEM_RELEASE);
 		return out;
+	}
+
+	// Re-reads many candidates quickly: one VirtualQuery per memory region, not per candidate.
+	inline void ReadMany(const std::vector<Cand>& a_c, std::vector<double>& a_v, std::vector<uint8_t>& a_ok)
+	{
+		a_v.assign(a_c.size() * 3, 0.0);
+		a_ok.assign(a_c.size(), 0);
+		uintptr_t lo = 0, hi = 0;
+		bool      readable = false;
+		for (size_t i = 0; i < a_c.size(); ++i) {
+			uintptr_t a = a_c[i].addr;
+			if (a < lo || a + 24 > hi) {
+				MEMORY_BASIC_INFORMATION mbi;
+				readable = VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+				           !(mbi.Protect & PAGE_GUARD) && (mbi.Protect & 0xFF) != PAGE_NOACCESS;
+				lo = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+				hi = lo + mbi.RegionSize;
+			}
+			if (!readable) continue;
+			double* v = &a_v[i * 3];
+			if (a_c[i].dbl) {
+				a_ok[i] = SafeCopy(v, reinterpret_cast<const void*>(a), 24);
+			} else {
+				float f[3];
+				a_ok[i] = SafeCopy(f, reinterpret_cast<const void*>(a), 12);
+				v[0] = f[0], v[1] = f[1], v[2] = f[2];
+			}
+		}
 	}
 
 	inline void FindAndLog(const double* a_xyz, double a_tol, size_t a_max)
@@ -617,6 +656,7 @@ namespace cb
 		void (*fillCommon)(Row&) = nullptr;          // Wwise listener/emitter (set by wwise.h)
 		void (*summaryCommon)() = nullptr;
 		bool (*commandCommon)(int, char**) = nullptr;
+		void (*workerTick)() = nullptr;              // every ~10 ms on the probe thread
 	};
 	inline GameHooks g_game;
 
@@ -885,6 +925,7 @@ namespace cb
 		for (;;) {
 			Sleep(10);
 			double now = Now();
+			if (g_game.workerTick) g_game.workerTick();
 			// No frame hook for a second (menus, loading, or the hook never fired): sample at 20 Hz anyway.
 			if (g_csvOn && now - g_lastTick.load() > 1.0 && now >= nextFallback) {
 				nextFallback = now + 0.05;
