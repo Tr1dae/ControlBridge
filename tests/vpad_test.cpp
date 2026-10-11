@@ -1,6 +1,6 @@
 // Offline test of Control's virtual pad (src/probe_control/vpad.h) against the real system
 // xinput1_4.dll and a private link mapping: served while the host is alive with an active pad,
-// passed through otherwise; fake focus follows. Exit code 0 = passed.
+// passed through otherwise. Exit code 0 = passed.
 #include "../src/probe_control/vpad.h"
 
 #include <cstdio>
@@ -30,14 +30,13 @@ int main()
 	auto    get = reinterpret_cast<vpad::GetStateFn>(GetProcAddress(x, "XInputGetState"));
 	CHECK(x && get);
 
-	vpad::g_enabled = vpad::g_fakeFocus = true;
+	vpad::g_enabled = true;
 	vpad::Tick();
 	CHECK(vpad::g_hooked[0] && vpad::g_orig[0]);
 	CHECK(g_xget.load() == reinterpret_cast<XGetFn>(vpad::g_orig[0]));  // the sampler bypasses the hook
 
 	vpad::XStateRaw st{};
 	DWORD           real = vpad::g_orig[0](0, &st);  // whatever is (or isn't) plugged in
-	CHECK(!vpad::ForceFocus());
 
 	// Host alive with an active pad: index 0 is the host's pad, through the game's own entry point.
 	proto::PadState p{ proto::kPadActive, 4242, 0x1000 | 0x0100, 10, 250, -32768, 32767, 1234, -1234 };
@@ -47,21 +46,18 @@ int main()
 	CHECK(get(0, &st) == ERROR_SUCCESS);
 	CHECK(st.packet == 4242 && st.pad.buttons == (0x1000 | 0x0100) && st.pad.lt == 10 && st.pad.rt == 250);
 	CHECK(st.pad.lx == -32768 && st.pad.ly == 32767 && st.pad.rx == 1234 && st.pad.ry == -1234);
-	CHECK(vpad::ForceFocus());
 	CHECK(get(1, &st) == vpad::g_orig[0](1, &st));  // other indices pass through
 
 	// Pad inactive (Resonant not in front): pass through, no fake focus.
 	p.flags = 0;
 	link::Write(bridge::g_map.shm->pad, p);
 	CHECK(get(0, &st) == real);
-	CHECK(!vpad::ForceFocus());
 
 	// Host gone (heartbeat old): pass through even with an active pad left in the slot.
 	p.flags = proto::kPadActive;
 	link::Write(bridge::g_map.shm->pad, p);
 	bridge::g_map.shm->header.hostHeartbeatMs = GetTickCount64() - 5000;
 	CHECK(get(0, &st) == real);
-	CHECK(!vpad::ForceFocus());
 
 	vpad::g_enabled = false;  // switched off: pass through
 	bridge::g_map.shm->header.hostHeartbeatMs = GetTickCount64();

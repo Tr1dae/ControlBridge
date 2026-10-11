@@ -280,6 +280,30 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
   while the host is alive with an active pad; passed through when inactive, when the host is gone, or
   when switched off.
 
+## In-game test 6 (2026-10-11): virtual pad live, but Control paused
+
+- **Virtual pad works:** once Resonant was up, Control's XInputGetState served the host pad (about
+  2,000 calls/s) and fake focus switched on.
+- **Control was already paused.** The tester alt-tabbed away from Control at 11:12:14 to start
+  Resonant, 18 s before the host joined the link. Control saw the focus loss and opened its pause menu.
+- **Resonant:** Dylan tracked (controller nearest the listener, 5.4 m, moving with him); camera view
+  found (fovY 51.6).
+- **How Control learns about focus:** coregame `GameWindow::dispatchAppEvent(app::Event*)` forwards
+  window events. `app::Event` starts with an int type, and `app::EventHandler::dispatchAppEvent`
+  switches on it (24 types, jump table at app+0x735c). Matched against `app::App`'s handleAppEvent
+  overloads (vtable app+0x14e58 via RTTI; slots 25/24/23/21):
+  - 0 = CloseEvent
+  - 1 = FocusEvent
+  - 2 = MinimizeEvent
+  - 4 = CharEvent
+
+  The event classes have no RTTI.
+- **Fix (`src/probe_control/focus.h`, FakeFocus=1, always on, not only when the host is up):**
+  - Focus and Minimize events are swallowed.
+  - `hasFocus` / `isMinimized` report true / false, and the window's bytes +0x7C / +0x7D are held there.
+  - `ClipCursor` / `SetCursorPos` are ignored while Control isn't really the foreground window, so it
+    can't take the mouse from Resonant.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`

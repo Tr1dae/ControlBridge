@@ -3,10 +3,8 @@
 // XInputGetState in whichever of those modules is loaded. While the link's host is alive and its pad
 // is active (Resonant in front, a controller connected), user index 0 returns that pad; otherwise
 // every call passes through unchanged.
-//
-// FakeFocus: Control reads GameWindow::hasFocus (+0x7C) to decide whether it is in front; while the
-// virtual pad is live the probe's hasFocus detour answers true, so gameplay input is taken in the
-// background. Both are switched by controlbridge.ini (VirtualPad=1, FakeFocus=1).
+// Switched by controlbridge.ini (VirtualPad=1). Keeping Control running in the background is
+// focus.h's job (FakeFocus=1).
 #pragma once
 
 #include "../common/bridge.h"
@@ -27,7 +25,7 @@ namespace cb::vpad
 	};
 	using GetStateFn = DWORD(WINAPI*)(DWORD, XStateRaw*);
 
-	inline bool                  g_enabled = false, g_fakeFocus = false;
+	inline bool                  g_enabled = false;
 	inline GetStateFn            g_orig[3] = {};
 	inline const wchar_t* const  kDlls[3] = { L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll" };
 	inline bool                  g_hooked[3] = {};
@@ -79,23 +77,15 @@ namespace cb::vpad
 		}
 	}
 
-	// GameWindow::hasFocus detour asks this: pretend to be in front while the host's pad is there to
-	// drive Jesse (not tied to g_live: an unfocused Control might stop polling XInput altogether).
-	inline bool ForceFocus()
-	{
-		proto::PadState p;
-		return g_enabled && g_fakeFocus && HostPad(p);
-	}
-
 	inline void Summary()
 	{
 		if (!g_enabled) return;
 		uint64_t c = g_calls.load(), s = g_served.load();
 		proto::PadState p{};
 		bool            host = HostPad(p);
-		Log("vpad: XInputGetState %llu calls (+%llu), virtual pad served %llu (+%llu); host pad %s; fake focus %s",
+		Log("vpad: XInputGetState %llu calls (+%llu), virtual pad served %llu (+%llu); host pad %s",
 			static_cast<unsigned long long>(c), static_cast<unsigned long long>(c - g_callsMark), static_cast<unsigned long long>(s),
-			static_cast<unsigned long long>(s - g_servedMark), host ? "active" : "inactive", ForceFocus() ? "ON" : "off");
+			static_cast<unsigned long long>(s - g_servedMark), host ? "active" : "inactive");
 		g_callsMark = c;
 		g_servedMark = s;
 	}
@@ -103,7 +93,6 @@ namespace cb::vpad
 	inline void Init()
 	{
 		g_enabled = IniInt(L"VirtualPad", 0) != 0;
-		g_fakeFocus = IniInt(L"FakeFocus", 0) != 0;
-		Log("vpad: virtual pad %s, fake focus %s", g_enabled ? "on" : "off", g_fakeFocus ? "on" : "off");
+		Log("vpad: virtual pad %s", g_enabled ? "on" : "off");
 	}
 }

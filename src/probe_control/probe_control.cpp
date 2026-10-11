@@ -14,6 +14,7 @@
 #include "../common/probe.h"
 #include "../common/bridge.h"
 #include "../common/wwise.h"
+#include "focus.h"
 #include "vpad.h"
 
 using namespace cb;
@@ -152,20 +153,21 @@ namespace
 		if (prev != (a_v ? 1 : 0)) Log("focus: %s %d -> %d (obj %p, thread %lu)", a_what, prev, a_v ? 1 : 0, a_obj, GetCurrentThreadId());
 	}
 
-	// The logged values are the real ones; while the virtual pad drives Jesse (vpad.h) the game is told
-	// it has focus and isn't minimized.
+	// The logged values are the real ones; with fake focus on (focus.h) the game is told it has focus
+	// and isn't minimized.
 	bool HasFocusDetour(const void* a_win)
 	{
+		focus::g_window = reinterpret_cast<uintptr_t>(a_win);
 		bool v = g_hasFocusOrig(a_win);
 		NoteChange(g_lastHasFocus, v, "GameWindow::hasFocus", a_win);
-		return v || vpad::ForceFocus();
+		return v || focus::Force();
 	}
 
 	bool IsMinimizedDetour(const void* a_win)
 	{
 		bool v = g_isMinOrig(a_win);
 		NoteChange(g_lastIsMin, v, "GameWindow::isMinimized", a_win);
-		return v && !vpad::ForceFocus();
+		return v && !focus::Force();
 	}
 
 	void InputFocusDetour(void* a_mgr, bool a_v)
@@ -231,6 +233,7 @@ namespace
 		LogCamera();
 		bridge::Summary();
 		vpad::Summary();
+		focus::Summary();
 	}
 
 	// Phase 1 (passive): Jesse and the camera go to the link every frame.
@@ -306,6 +309,7 @@ namespace
 			reinterpret_cast<void**>(&g_isMinOrig), "GameWindow::isMinimized");
 		Hook(Export(core, "?setGamePaused@GameHelper@coregame@@SAX_N@Z"), reinterpret_cast<void*>(&SetPausedDetour),
 			reinterpret_cast<void**>(&g_setPausedOrig), "GameHelper::setGamePaused");
+		focus::Install(core);
 		HMODULE input = FirstModule({ L"input_rmdwin10_f.dll", L"input_rmdwin7_f.dll" });
 		Hook(Export(input, "?setFocus@InputManager@input@@QEAAX_N@Z"), reinterpret_cast<void*>(&InputFocusDetour),
 			reinterpret_cast<void**>(&g_inputFocusOrig), "InputManager::setFocus");
@@ -317,6 +321,7 @@ namespace
 		g_game.workerTick = [] {
 			wwise::autorecon::Tick();
 			vpad::Tick();
+			focus::Tick();
 		};
 		g_game.publish = Publish;
 		g_game.fill = Fill;
