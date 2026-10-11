@@ -462,6 +462,9 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
 - Now the video opens normally and is sought to its last frame with `BinkGoto` (HBINK =
   {Width, Height, Frames, FrameNum, ...}), so handles and textures stay valid.
 
+- 2026-10-11: the intro skip was removed again (the tester uses dedicated intro-skip mods). The Bink
+  findings stay valid: Control's intro is a video texture; never refuse to open it.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
