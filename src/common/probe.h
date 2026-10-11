@@ -102,6 +102,8 @@ namespace cb
 		QueryPerformanceCounter(&g_qp0);
 		g_dir = IniString(L"LogDir", ModuleDir(a_self) + L"\\ControlBridge-logs");
 		CreateDirectoryW(g_dir.c_str(), nullptr);
+		// Keep the previous session's log (test 7: a game restart overwrote the session that mattered).
+		MoveFileExW(Path(g_tag + L"_probe.log").c_str(), Path(g_tag + L"_probe.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
 		g_log = _wfsopen(Path(g_tag + L"_probe.log").c_str(), L"w", _SH_DENYWR);
 		wchar_t exe[MAX_PATH];
 		GetModuleFileNameW(nullptr, exe, MAX_PATH);

@@ -2,7 +2,8 @@
 // opened) before Resonant was even up, so Jesse never moved. Control learns about focus three ways,
 // and all three are covered while faking:
 //   1. app::FocusEvent / app::MinimizeEvent objects through coregame::GameWindow::dispatchAppEvent
-//      (exported): swallowed, identified by their type id. The first event of every type is logged.
+//      (exported): focus-lost and minimized events are swallowed (gained / restored pass), identified
+//      by their type id. The first event of every type is logged.
 //   2. GameWindow::hasFocus / isMinimized (bytes +0x7C / +0x7D, getters imported by the exe): the
 //      detours in probe_control.cpp answer true / false, and the bytes are held there.
 //   3. A game that thinks it has focus clips and re-centres the cursor: ClipCursor and SetCursorPos
@@ -46,11 +47,16 @@ namespace cb::focus
 			HexDump(reinterpret_cast<uintptr_t>(a_ev), 0x20);
 		}
 		if (type == kFocusEvent || type == kMinimizeEvent) {
-			uint8_t b[8] = {};
-			SafeRead(b, reinterpret_cast<uintptr_t>(a_ev) + 4, sizeof(b));
-			Log("focus: %s event %s (payload %02x %02x %02x %02x %02x %02x %02x %02x)", type == kFocusEvent ? "Focus" : "Minimize",
-				g_fake ? "SWALLOWED" : "passed", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
-			if (g_fake) {
+			// The int after the type is the new state: Focus 1 = gained / 0 = lost, Minimize 1 = minimized /
+			// 0 = restored (test 7: the startup "gained" event, payload 01, was swallowed too, so Control
+			// never thought it had focus and ignored the controller). Only losses are swallowed.
+			int32_t state = -1;
+			Read(reinterpret_cast<uintptr_t>(a_ev) + 4, state);
+			bool loss = type == kFocusEvent ? state == 0 : state == 1;
+			bool swallow = g_fake && loss;
+			Log("focus: %s event, state %d (%s): %s", type == kFocusEvent ? "Focus" : "Minimize", state,
+				type == kFocusEvent ? (state ? "gained" : "lost") : (state ? "minimized" : "restored"), swallow ? "SWALLOWED" : "passed");
+			if (swallow) {
 				g_swallowed.fetch_add(1);
 				return false;
 			}

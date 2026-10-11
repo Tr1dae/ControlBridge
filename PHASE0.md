@@ -304,6 +304,17 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
   - `ClipCursor` / `SetCursorPos` are ignored while Control isn't really the foreground window, so it
     can't take the mouse from Resonant.
 
+## In-game test 7 (2026-10-11): no pause, but the controller ignored
+
+- Control no longer pauses on alt-tab, and mouse/keyboard work in both games.
+- **The controller stopped working in Control** right after the first menu press, and Jesse didn't
+  follow the virtual pad (the monitor saw the host pad active in all 421 samples, while Jesse's
+  position changed 4 times). Cause: the startup Focus event (type 1, state int at +4 = 1, "gained") was
+  swallowed along with the losses, so Control never thought it had focus and ignored gamepad input.
+  Now only losses are swallowed (Focus state 0, Minimize state 1).
+- A game restart overwrote the log of the session that mattered. The probe now keeps the previous one
+  as `<tag>_probe.prev.log`.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
