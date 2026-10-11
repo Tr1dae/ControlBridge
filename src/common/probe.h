@@ -381,25 +381,77 @@ namespace cb
 		}
 	}
 
-	// 8-aligned heap addresses holding the qword a_value (a vtable address finds live objects).
-	// Copies 1 MB chunks under SEH, so memory freed mid-scan is skipped, not crashed on.
+	// ---- fast in-place scans ---------------------------------------------------------------------------
+	// Scan live memory directly (no copying) under SEH, region slice by slice; results go into a
+	// private VirtualAlloc block that the scans skip, so they can't find their own output.
+	struct ScanHit
+	{
+		uintptr_t addr;
+		uint64_t  value;
+	};
+
+	inline size_t ScanQwordsRaw(const uint64_t* a_p, size_t a_n, uint64_t a_lo, uint64_t a_span, ScanHit* a_out, size_t a_cap)
+	{
+		size_t k = 0;
+		__try {
+			for (size_t i = 0; i < a_n && k < a_cap; ++i) {
+				uint64_t v = a_p[i];
+				if (v - a_lo < a_span) a_out[k++] = { reinterpret_cast<uintptr_t>(a_p + i), v };
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+		}
+		return k;
+	}
+
+	template <class T>
+	struct ScanBuffer
+	{
+		T*     p = nullptr;
+		size_t cap = 0, n = 0;
+		explicit ScanBuffer(size_t a_cap) : cap(std::max<size_t>(a_cap, 1))
+		{
+			p = static_cast<T*>(VirtualAlloc(nullptr, cap * sizeof(T), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+			if (!p) cap = 0;
+		}
+		~ScanBuffer()
+		{
+			if (p) VirtualFree(p, 0, MEM_RELEASE);
+		}
+		bool Owns(uintptr_t a_base) const { return a_base == reinterpret_cast<uintptr_t>(p); }
+	};
+
+	// 8-aligned private memory (and, if a_modules, the .data of every loaded module) holding a qword in
+	// [a_lo, a_lo + a_span). a_span 1 = exact value (e.g. a vtable address finds live objects).
+	inline std::vector<ScanHit> ScanQwords(uint64_t a_lo, uint64_t a_span, size_t a_max, bool a_modules = false)
+	{
+		ScanBuffer<ScanHit> buf(a_max);
+		ULONG_PTR           stackLo = 0, stackHi = 0;  // our own stack holds copies of what we look for
+		GetCurrentThreadStackLimits(&stackLo, &stackHi);
+		auto scan = [&](uintptr_t a_base, size_t a_size) {
+			if ((a_base >= stackLo && a_base < stackHi) || buf.Owns(a_base)) return;
+			for (size_t off = 0; off < a_size && buf.n < buf.cap; off += 16u << 20) {
+				size_t len = std::min<size_t>(16u << 20, a_size - off);
+				buf.n += ScanQwordsRaw(reinterpret_cast<const uint64_t*>(a_base + off), len / 8, a_lo, a_span, buf.p + buf.n, buf.cap - buf.n);
+			}
+		};
+		ForEachHeapRegion(scan);
+		if (a_modules) {
+			HMODULE mods[1024];
+			DWORD   need = 0;
+			EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need);
+			for (DWORD i = 0; i < need / sizeof(HMODULE) && i < 1024; ++i) {
+				uintptr_t db;
+				size_t    dn;
+				if (mods[i] != g_self && Section(mods[i], ".data", db, dn)) scan(db, dn);
+			}
+		}
+		return std::vector<ScanHit>(buf.p, buf.p + buf.n);
+	}
+
 	inline std::vector<uintptr_t> ScanHeap(uint64_t a_value, size_t a_max)
 	{
 		std::vector<uintptr_t> out;
-		std::vector<uint64_t>  chunk(1 << 17);
-		ULONG_PTR              stackLo = 0, stackHi = 0;  // our own stack holds copies of a_value
-		GetCurrentThreadStackLimits(&stackLo, &stackHi);
-		ForEachHeapRegion([&](uintptr_t a_base, size_t a_size) {
-			if (a_base >= stackLo && a_base < stackHi) return;
-			for (size_t off = 0; off < a_size && out.size() < a_max; off += chunk.size() * 8) {
-				size_t n = std::min(chunk.size() * 8, a_size - off);
-				if (!SafeCopy(chunk.data(), reinterpret_cast<const void*>(a_base + off), n)) continue;
-				for (size_t i = 0; i < n / 8 && out.size() < a_max; ++i) {
-					if (chunk[i] == a_value && a_base + off + i * 8 != reinterpret_cast<uintptr_t>(&chunk[i])) out.push_back(a_base + off + i * 8);
-				}
-			}
-			Sleep(0);
-		});
+		for (auto& h : ScanQwords(a_value, 1, a_max)) out.push_back(h.addr);
 		return out;
 	}
 
@@ -452,49 +504,48 @@ namespace cb
 		return true;
 	}
 
+	inline size_t FindTripleRaw(const uint8_t* a_p, size_t a_len, bool a_dbl, const double* a_xyz, const double* a_tol, Cand* a_out,
+		size_t a_cap)
+	{
+		size_t       k = 0;
+		const size_t stride = a_dbl ? 8 : 4, span = 3 * stride;
+		__try {
+			for (size_t i = 0; i + span <= a_len && k < a_cap; i += stride) {
+				double v0 = a_dbl ? *reinterpret_cast<const double*>(a_p + i) : *reinterpret_cast<const float*>(a_p + i);
+				if (!(std::fabs(v0 - a_xyz[0]) <= a_tol[0])) continue;  // also rejects NaN
+				double v1 = a_dbl ? *reinterpret_cast<const double*>(a_p + i + 8) : *reinterpret_cast<const float*>(a_p + i + 4);
+				double v2 = a_dbl ? *reinterpret_cast<const double*>(a_p + i + 16) : *reinterpret_cast<const float*>(a_p + i + 8);
+				if (!(std::fabs(v1 - a_xyz[1]) <= a_tol[1]) || !(std::fabs(v2 - a_xyz[2]) <= a_tol[2])) continue;
+				a_out[k].addr = reinterpret_cast<uintptr_t>(a_p + i);
+				a_out[k].dbl = a_dbl;
+				a_out[k].first[0] = v0, a_out[k].first[1] = v1, a_out[k].first[2] = v2;
+				++k;
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+		}
+		return k;
+	}
+
+	// Triples within a_tol (per axis) of a_xyz, as doubles or floats, scanned in place.
+	inline std::vector<Cand> FindTriple(const double* a_xyz, const double* a_tol, bool a_dbl, size_t a_max)
+	{
+		ScanBuffer<Cand> buf(a_max);
+		ULONG_PTR        stackLo = 0, stackHi = 0;
+		GetCurrentThreadStackLimits(&stackLo, &stackHi);
+		ForEachHeapRegion([&](uintptr_t a_base, size_t a_size) {
+			if ((a_base >= stackLo && a_base < stackHi) || buf.Owns(a_base)) return;
+			for (size_t off = 0; off < a_size && buf.n < buf.cap; off += 16u << 20) {
+				size_t len = std::min<size_t>(16u << 20, a_size - off);
+				buf.n += FindTripleRaw(reinterpret_cast<const uint8_t*>(a_base + off), len, a_dbl, a_xyz, a_tol, buf.p + buf.n, buf.cap - buf.n);
+			}
+		});
+		return std::vector<Cand>(buf.p, buf.p + buf.n);
+	}
+
 	inline std::vector<Cand> FindTriple(const double* a_xyz, double a_tol, bool a_dbl, size_t a_max)
 	{
-		// Results go into one private block that the scan skips: every stored candidate is itself a
-		// matching triple, so a heap-allocated, growing result array would find its own entries.
-		size_t bytes = std::max<size_t>(a_max, 1) * sizeof(Cand);
-		auto*  res = static_cast<Cand*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-		if (!res) return {};
-		size_t               n = 0;
-		std::vector<uint8_t> chunk(1 << 20);
-		const size_t         stride = a_dbl ? 8 : 4, span = 3 * stride;
-		ULONG_PTR            stackLo = 0, stackHi = 0;
-		GetCurrentThreadStackLimits(&stackLo, &stackHi);
-		auto skip = [&](uintptr_t a_at) {
-			return (a_at >= reinterpret_cast<uintptr_t>(chunk.data()) && a_at < reinterpret_cast<uintptr_t>(chunk.data()) + chunk.size()) ||
-			       (a_at >= reinterpret_cast<uintptr_t>(res) && a_at < reinterpret_cast<uintptr_t>(res) + bytes);
-		};
-		ForEachHeapRegion([&](uintptr_t a_base, size_t a_size) {
-			if ((a_base >= stackLo && a_base < stackHi) || a_base == reinterpret_cast<uintptr_t>(res)) return;
-			for (size_t off = 0; off < a_size && n < a_max; off += chunk.size() - span) {
-				size_t len = std::min(chunk.size(), a_size - off);
-				if (len < span || !SafeCopy(chunk.data(), reinterpret_cast<const void*>(a_base + off), len)) continue;
-				const uint8_t* b = chunk.data();
-				for (size_t i = 0; i + span <= len && n < a_max; i += stride) {
-					double v[3];
-					if (a_dbl) {
-						memcpy(v, b + i, 24);
-					} else {
-						float f[3];
-						memcpy(f, b + i, 12);
-						v[0] = f[0], v[1] = f[1], v[2] = f[2];
-					}
-					if (std::fabs(v[0] - a_xyz[0]) > a_tol || std::fabs(v[1] - a_xyz[1]) > a_tol || std::fabs(v[2] - a_xyz[2]) > a_tol) continue;
-					uintptr_t at = a_base + off + i;
-					if (skip(at)) continue;
-					res[n++] = { at, a_dbl, { v[0], v[1], v[2] } };
-				}
-				if (len < chunk.size()) break;
-			}
-			Sleep(0);
-		});
-		std::vector<Cand> out(res, res + n);
-		VirtualFree(res, 0, MEM_RELEASE);
-		return out;
+		double tol[3] = { a_tol, a_tol, a_tol };
+		return FindTriple(a_xyz, tol, a_dbl, a_max);
 	}
 
 	// Re-reads many candidates quickly: one VirtualQuery per memory region, not per candidate.

@@ -20,7 +20,8 @@ namespace m
 		virtual float Fov() const { return fov; }
 		uint8_t pad[0x68];      // vptr(8) + 0x68 = 0x70
 		double  viewToWorld[12];
-		uint8_t pad2[0x2E0 - 0x70 - 96];
+		double  viewToClip[16];  // +0xD0
+		uint8_t pad2[0x2E0 - 0xD0 - 128];
 		float   fov = 1.0f;
 	};
 	static_assert(offsetof(PerspectiveView, viewToWorld) == 0x70);
@@ -157,6 +158,8 @@ int main()
 	view->viewToWorld[10] = 5;
 	view->viewToWorld[11] = -40;
 	view->fov = 1.2f;
+	for (double& v : view->viewToClip) v = 0;
+	view->viewToClip[5] = 1.0 / std::tan(0.6);  // fovY 1.2 rad
 
 	// ---- frames + CSV ----
 	for (int i = 0; i < 5; ++i) CHECK(FakeRenderAudio(true) == 1);
@@ -231,7 +234,7 @@ int main()
 		auto*  wrong = new double[3]{ 299.5, 9.5, 69.5 }; // moves, but the other way
 		float  emi[9] = { 0, 0, 1, 0, 1, 0, 300.0f, 10.0f, 70.0f };
 		FakeSetPosition(900, emi);
-		autofind::Start(900, 2.0);
+		autofind::Start(900, 2.0, 2.0);
 		CHECK(autofind::g_state == autofind::kWaitMove && !autofind::g_c.empty());
 		for (int round = 0; round < 2; ++round) {
 			emi[6] += 5.0f;
@@ -263,7 +266,8 @@ int main()
 	CHECK(log.find("obs 2 fake_system") != std::string::npos);
 	CHECK(log.find("keep moved: 1 of") != std::string::npos);
 	CHECK(log.find("rtti") != std::string::npos && log.find("'PerspectiveView@m'") != std::string::npos);
-	CHECK(log.find("listener pos as doubles at +b8") != std::string::npos);  // 0x70 + 9*8
+	CHECK(log.find("0.00 m  pos 100.000 5.000 -40.000") != std::string::npos);
+	CHECK(log.find("views: tracking [0]") != std::string::npos);
 	CHECK(log.find("unknown command") != std::string::npos);
 	CHECK(log.find("tracking view") != std::string::npos);
 

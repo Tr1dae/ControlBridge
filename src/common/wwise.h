@@ -293,58 +293,65 @@ namespace cb::wwise
 		inline std::vector<uintptr_t> g_vts;
 		inline std::atomic<uintptr_t> g_view{ 0 };
 		inline uintptr_t              g_viewVt = 0;
-		inline uint32_t               g_matOff = 0x70, g_fovOff = 0x2E0;
+		inline uint32_t               g_matOff = 0x70;  // Control 1; Resonant sets 0x68
 
-		inline void WatchBest(uintptr_t a_at);
+		// FOV from the view-to-clip matrix that follows view-to-world (+0x60 after it in m::View).
+		inline float FovY(uintptr_t a_view)
+		{
+			double p5 = 0;
+			if (!Read(a_view + g_matOff + 0x60 + 5 * 8, p5) || p5 == 0.0 || !std::isfinite(p5)) return 0.0f;
+			return static_cast<float>(2.0 * std::atan(1.0 / std::fabs(p5)));
+		}
 
+		// Lists live m::PerspectiveView objects whose position (view-to-world row 3) is near the
+		// listener, dumps the closest to view_<n>.bin, finds what points at them (globals show as
+		// module+rva) and tracks the closest in the CSV (c0..c11, fov).
 		inline void Find(size_t a_max)
 		{
 			if (g_vts.empty() && g_mod) g_vts = FindVtables(g_mod, "PerspectiveView@m");
-			Xf     lis{};
-			bool   haveLis = Get(ListenerId(), lis);
-			Log("views: %zu vtable(s) of m::PerspectiveView; listener %s", g_vts.size(), haveLis ? "known" : "unknown");
-			uintptr_t bestAt = 0;
-			double    bestD = 0.5;
+			Xf   lis{};
+			bool haveLis = Get(ListenerId(), lis);
+			Log("views: %zu vtable(s) of m::PerspectiveView, view-to-world at +%x; listener %s", g_vts.size(), g_matOff, haveLis ? "known" : "unknown");
+			if (!haveLis) return;
+			struct Hit
+			{
+				uintptr_t inst, vt;
+				double    dist;
+			};
+			std::vector<Hit> hits;
+			size_t           total = 0;
 			for (uintptr_t vt : g_vts) {
 				auto inst = ScanHeap(vt, a_max);
-				Log("  vtable %s: %zu instance(s)", Rva(vt).c_str(), inst.size());
+				total += inst.size();
 				for (uintptr_t p : inst) {
-					uint8_t b[0x400];
-					if (!SafeRead(b, p, sizeof(b))) continue;
-					double m[12];
-					float  fov;
-					memcpy(m, b + g_matOff, sizeof(m));
-					memcpy(&fov, b + g_fovOff, 4);
-					Log("    %p  fov@%x=%.4g  mat@%x: [%.3f %.3f %.3f] [%.3f %.3f %.3f] [%.3f %.3f %.3f] [%.3f %.3f %.3f]", reinterpret_cast<void*>(p),
-						g_fovOff, fov, g_matOff, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
-					if (!haveLis) continue;
-					// Where does the listener's position appear in this object (doubles or floats)?
-					for (uint32_t o = 0; o + 24 <= sizeof(b); o += 8) {
-						double d[3];
-						memcpy(d, b + o, 24);
-						if (std::isfinite(d[0]) && Dist(d, lis.pos) < 0.5) {
-							Log("      listener pos as doubles at +%x (%.3f m)", o, Dist(d, lis.pos));
-							if (Dist(d, lis.pos) < bestD) bestD = Dist(d, lis.pos), bestAt = p + o;
-						}
-					}
-					for (uint32_t o = 0; o + 12 <= sizeof(b); o += 4) {
-						float  f[3];
-						memcpy(f, b + o, 12);
-						double d[3] = { f[0], f[1], f[2] };
-						if (std::isfinite(d[0]) && Dist(d, lis.pos) < 0.5) Log("      listener pos as floats at +%x (%.3f m)", o, Dist(d, lis.pos));
-					}
+					double pos[3];
+					if (SafeRead(pos, p + g_matOff + 0x48, 24) && std::isfinite(pos[0])) hits.push_back({ p, vt, Dist(pos, lis.pos) });
 				}
 			}
-			WatchBest(bestAt);
-		}
-
-		inline void WatchBest(uintptr_t a_at)
-		{
-			if (!a_at) return;
-			AcquireSRWLockExclusive(&g_watchLock);
-			g_watch[3] = { a_at, true };
-			ReleaseSRWLockExclusive(&g_watchLock);
-			Log("views: best listener match %p (%s) -> CSV w9..w11", reinterpret_cast<void*>(a_at), Rva(a_at).c_str());
+			std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.dist < b.dist; });
+			Log("views: %zu instance(s); nearest to the listener:", total);
+			for (size_t i = 0; i < hits.size() && i < 8; ++i) {
+				double m[12];
+				SafeRead(m, hits[i].inst + g_matOff, sizeof(m));
+				Log("  [%zu] %p %.2f m  pos %.3f %.3f %.3f  fwd %.3f %.3f %.3f  up %.3f %.3f %.3f  fovY %.1f deg", i, reinterpret_cast<void*>(hits[i].inst),
+					hits[i].dist, m[9], m[10], m[11], m[6], m[7], m[8], m[3], m[4], m[5], FovY(hits[i].inst) * 57.29578f);
+				if (i < 4) {
+					uint8_t b[0x400] = {};
+					SafeRead(b, hits[i].inst, sizeof(b));
+					wchar_t name[64];
+					swprintf(name, 64, L"%ls_view_%zu.bin", g_tag.c_str(), i);
+					if (FILE* f = _wfopen(Path(name).c_str(), L"wb")) {
+						fwrite(b, 1, sizeof(b), f);
+						fclose(f);
+					}
+					for (auto& h : ScanQwords(hits[i].inst, 1, 16, true)) Log("      pointed to from %s", Rva(h.addr).c_str());
+				}
+			}
+			if (!hits.empty() && hits[0].dist < 5.0) {
+				g_viewVt = hits[0].vt;
+				g_view = hits[0].inst;
+				Log("views: tracking [0] in CSV c0..c11 / fov");
+			}
 		}
 
 		inline void Fill(Row& a_r)
@@ -357,7 +364,10 @@ namespace cb::wwise
 				Log("view %p: gone (vtable changed), tracking stopped", reinterpret_cast<void*>(p));
 				return;
 			}
-			if (SafeRead(a_r.cam, p + g_matOff, sizeof(a_r.cam)) && Read(p + g_fovOff, a_r.fov)) a_r.flags |= kRowCam;
+			if (SafeRead(a_r.cam, p + g_matOff, sizeof(a_r.cam))) {
+				a_r.fov = FovY(p);
+				a_r.flags |= kRowCam;
+			}
 		}
 	}
 
@@ -381,6 +391,11 @@ namespace cb::wwise
 		inline double            g_from[3], g_last[3], g_still = 0;
 		inline int               g_round = 0;
 		inline std::vector<Cand> g_c;
+
+		// Chimes tell the tester what to do without looking at the log: asterisk = "walk now",
+		// default beep = "round done, walk again", exclamation = "finished".
+		inline void Chime(UINT a_type) { MessageBeep(a_type); }
+
 
 		inline bool RefPos(double* a_out)
 		{
@@ -406,6 +421,28 @@ namespace cb::wwise
 			if (!g_c.empty()) Log("autofind: watching the first %zu in CSV w0..w8; 'cands' lists them all", std::min<size_t>(3, g_c.size()));
 			g_cands = g_c;
 			g_state = kIdle;
+			// For the double hits: dump the memory around them and list what points into that memory
+			// (the start of the owning object/array is usually just below the position).
+			int dumped = 0;
+			for (size_t i = 0; i < g_c.size() && dumped < 4; ++i) {
+				if (!g_c[i].dbl) continue;
+				uintptr_t a = g_c[i].addr;
+				uint8_t   b[0x400] = {};
+				SafeRead(b, a - 0x200, sizeof(b));
+				wchar_t name[64];
+				swprintf(name, 64, L"%ls_player_%d.bin", g_tag.c_str(), dumped);
+				if (FILE* f = _wfopen(Path(name).c_str(), L"wb")) {
+					fwrite(b, 1, sizeof(b), f);
+					fclose(f);
+				}
+				Log("autofind: [%zu] %p dumped -0x200..+0x200 to %ls; pointers into it:", i, reinterpret_cast<void*>(a), name);
+				for (auto& h : ScanQwords(a - 0x1000, 0x1040, 24, true)) {
+					Log("      %s holds %p (= position %+lld)", Rva(h.addr).c_str(), reinterpret_cast<void*>(h.value),
+						static_cast<long long>(h.value) - static_cast<long long>(a));
+				}
+				++dumped;
+			}
+			Chime(MB_ICONEXCLAMATION);
 		}
 
 		inline void Filter(const double* a_now)
@@ -433,26 +470,31 @@ namespace cb::wwise
 			} else {
 				g_state = kWaitMove;
 				Log("autofind: move the player again (> 3 m) and stop");
+				Chime(MB_OK);
 			}
 		}
 
-		inline void Start(uint64_t a_ref, double a_box)
+		// a_side: half-width of the box in X and Z; a_up: half-height in Y (emitters ride on bones above
+		// the feet, so the box is tall and narrow).
+		inline void Start(uint64_t a_ref, double a_side, double a_up)
 		{
 			g_ref = a_ref;
 			if (!RefPos(g_from)) {
 				Log("autofind: reference %llu has no position", static_cast<unsigned long long>(a_ref));
 				return;
 			}
-			double t0 = Now();
-			g_c = FindTriple(g_from, a_box, true, 4000000);
+			double t0 = Now(), tol[3] = { a_side, a_up, a_side };
+			g_c = FindTriple(g_from, tol, true, 4000000);
 			size_t nd = g_c.size();
-			auto   f = FindTriple(g_from, a_box, false, 4000000);
+			auto   f = FindTriple(g_from, tol, false, 1000000);
 			g_c.insert(g_c.end(), f.begin(), f.end());
-			Log("autofind: reference %llu at %.3f %.3f %.3f, box %.2f m: %zu double + %zu float candidates (%.1f s). "
+			Log("autofind: reference %llu at %.3f %.3f %.3f, box +-%.2f/%.2f m: %zu double + %zu float candidates%s (%.1f s). "
 				"Now move the player > 3 m and stop.",
-				static_cast<unsigned long long>(a_ref), g_from[0], g_from[1], g_from[2], a_box, nd, f.size(), Now() - t0);
+				static_cast<unsigned long long>(a_ref), g_from[0], g_from[1], g_from[2], a_side, a_up, nd, f.size(),
+				nd >= 4000000 || f.size() >= 1000000 ? " (CAPPED: shrink the box)" : "", Now() - t0);
 			g_round = 0;
 			g_state = kWaitMove;
+			Chime(MB_ICONASTERISK);
 		}
 
 		inline void Tick()
@@ -499,13 +541,13 @@ namespace cb::wwise
 			if (now - g_firstSeen < 10.0 || now - g_still < 3.0) return;
 			g_done = true;
 			Log("auto recon: player standing still, searching camera views and the player's position");
-			views::Find(64);
+			views::Find(1024);
 			auto n = Nearest(lis.pos, 1, 0.5);
 			if (n.empty()) {
 				Log("auto recon: no emitter near the camera, autofind skipped");
 				return;
 			}
-			autofind::Start(n[0].id, 2.0);
+			autofind::Start(n[0].id, 1.0, 2.5);
 		}
 	}
 
@@ -605,7 +647,7 @@ namespace cb::wwise
 			}
 			Log("findnear: object %llu", static_cast<unsigned long long>(id));
 			FindAndLog(x.pos, argc > 2 ? atof(argv[2]) : 0.05, 4096);
-		} else if (!_stricmp(c, "autofind")) {  // autofind [emitter id | listener] [box m]
+		} else if (!_stricmp(c, "autofind")) {  // autofind [emitter id | listener] [side m] [up m]
 			uint64_t ref = 0;
 			Xf       lis;
 			if (argc > 1 && !_stricmp(argv[1], "listener")) {
@@ -620,19 +662,18 @@ namespace cb::wwise
 				Log("autofind: no reference object yet");
 				return true;
 			}
-			autofind::Start(ref, argc > 2 ? atof(argv[2]) : 2.0);
+			autofind::Start(ref, argc > 2 ? atof(argv[2]) : 1.0, argc > 3 ? atof(argv[3]) : 2.5);
 		} else if (!_stricmp(c, "views")) {  // views [max]
 			views::Find(argc > 1 ? strtoull(argv[1], nullptr, 10) : 32);
-		} else if (!_stricmp(c, "view") && argc > 1) {  // view <addr>|off [matOff] [fovOff]
+		} else if (!_stricmp(c, "view") && argc > 1) {  // view <addr>|off [matOff]
 			if (!_stricmp(argv[1], "off")) {
 				views::g_view = 0;
 			} else {
 				uintptr_t p = ParseAddr(argv[1]);
 				if (argc > 2) views::g_matOff = strtoul(argv[2], nullptr, 16);
-				if (argc > 3) views::g_fovOff = strtoul(argv[3], nullptr, 16);
 				Read(p, views::g_viewVt);
 				views::g_view = p;
-				Log("tracking view %p ('%s') mat +%x fov +%x", reinterpret_cast<void*>(p), ClassOf(p).c_str(), views::g_matOff, views::g_fovOff);
+				Log("tracking view %p ('%s') view-to-world +%x", reinterpret_cast<void*>(p), ClassOf(p).c_str(), views::g_matOff);
 			}
 		} else {
 			return false;

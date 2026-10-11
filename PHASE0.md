@@ -173,6 +173,32 @@ an alt-tab. Analysis: `tools/analyze_frames.py` plus the camera-turn check.
 - Dylan's own transform and the camera view are still unknown. The probe's `autofind` (delta-matching
   memory search seeded from his emitter) and `views` now run automatically (`AutoRecon=1`).
 
+## In-game test 2 (2026-10-11): auto recon
+
+- **Resonant: Dylan's position found** by delta-matching (2 moves of about 18 to 20 m):
+  - 702 survivors. The first is a **double triple at feet height** (y 0.145 while the camera
+    emitter is at 1.79): `575.917 0.145 -80.889`.
+  - A second double triple 0x58 bytes later lags slightly (`576.025 ... -80.882`): previous frame or
+    controller.
+  - The rest are float copies (render/animation).
+  - The first snapshot hit the caps (4M doubles + 4M floats with a ±2 m cube), so the box is now
+    ±1 m in X/Z and ±2.5 m in Y, with the float cap at 1M.
+- **Resonant camera:** `m::PerspectiveView` instances hold the camera position as doubles at
+  **+0xB0**, so Resonant's `m::View` is 8 bytes shorter before the matrix than Control's (view-to-world
+  at **+0x68**). It sits about 1.7 m from the Wwise listener: Resonant's listener is not exactly on the
+  camera (it's pulled toward Dylan), which is why the 0.5 m match failed.
+- **Control camera: `coreshared::g_pRenderView`** (exported `const m::View*`). m::View getters:
+  - view-to-world `+0x70` (rows right/up/forward/position; `getViewDirection` +0xA0,
+    `getViewPoint` +0xB8)
+  - view-to-clip `+0xD0`
+
+  The probe now reads it every frame. In test 2 the 64-instance cap was hit before the gameplay view
+  turned up.
+- Control's views scan took 19 s (copying every heap page). Scans now run in place under SEH, with
+  results in a private block the scan skips. Control's autofind never ran: the tester walked during
+  the views scan and quit during the snapshot. The probe now chimes (Windows sounds) at "walk now",
+  "walk again" and "done".
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`

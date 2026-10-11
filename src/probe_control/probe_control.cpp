@@ -5,11 +5,10 @@
 //   coregame  ClientPlayerController::getAvatarObject / ServerPlayerController::getAvatarObject
 //             -> Jesse's EntityState; right after the game gets it, the probe calls the exported
 //                EntityState::getTransform on the same thread (Matrix4x3<float>, raw into p0..p15)
-//             CameraComponentState::updateViewFromTransform -> every live camera; after the original
-//                runs: PerspectiveView at +0xC0, so view-to-world (Matrix4x3<double>) at +0x130
-//                and FOV at +0x3A0 (from View::getViewToWorld and PerspectiveView::getFov)
+//   coreshared g_pRenderView (const m::View*) -> the rendered camera: view-to-world at +0x70,
+//                view-to-clip at +0xD0 (test 1 showed CameraComponentState is not the gameplay camera)
 //   snd       AK::SoundEngine (see common/wwise.h): frame tick, listener, emitters
-// Commands (logs\control_cmd.txt) in addition to the common ones: avatar | cams | cam <i>|auto
+// Commands (logs\control_cmd.txt) in addition to the common ones: avatar | camera
 #include "fwd_winmm.h"
 
 #include "../common/probe.h"
@@ -85,61 +84,20 @@ namespace
 		return ent;
 	}
 
-	// ---- cameras -------------------------------------------------------------------------------
-	using UpdateViewFn = void (*)(void*);
-	UpdateViewFn g_updateViewOrig = nullptr;
-	constexpr uint32_t kCamMat = 0xC0 + 0x70, kCamFov = 0xC0 + 0x2E0;
+	// ---- camera: coreshared::g_pRenderView (const m::View*) ----------------------------------------
+	// m::View: view-to-world Matrix4x3<double> at +0x70 (rows right, up, forward, position: the
+	// exported getViewDirection = +0xA0, getViewPoint = +0xB8), view-to-clip Matrix4<double> at +0xD0.
+	const uintptr_t* g_renderView = nullptr;  // address of the global
 
-	struct Cam
+	bool ReadCamera(double* a_m12, float& a_fovY)
 	{
-		void*    p;
-		uint64_t n, nMark;
-		double   t;
-		double   m[12];
-		float    fov;
-	};
-	constexpr int kCams = 32;
-	Cam     g_cams[kCams] = {};
-	int     g_camSel = -1;  // -1: auto (most updated camera seen in the last 0.25 s)
-	SRWLOCK g_camLock = SRWLOCK_INIT;
-
-	void UpdateViewDetour(void* a_cam)
-	{
-		g_updateViewOrig(a_cam);
-		Cam c{};
-		auto b = static_cast<const uint8_t*>(a_cam);
-		if (!SafeCopy(c.m, b + kCamMat, sizeof(c.m)) || !SafeCopy(&c.fov, b + kCamFov, 4)) return;
-		c.t = Now();
-		AcquireSRWLockExclusive(&g_camLock);
-		int slot = -1, oldest = 0;
-		for (int i = 0; i < kCams; ++i) {
-			if (g_cams[i].p == a_cam) {
-				slot = i;
-				break;
-			}
-			if (g_cams[i].t < g_cams[oldest].t) oldest = i;
-		}
-		if (slot < 0) {
-			slot = oldest;
-			g_cams[slot] = {};
-			g_cams[slot].p = a_cam;
-		}
-		Cam& d = g_cams[slot];
-		memcpy(d.m, c.m, sizeof(c.m));
-		d.fov = c.fov;
-		d.t = c.t;
-		++d.n;
-		ReleaseSRWLockExclusive(&g_camLock);
-	}
-
-	int SelectedCam(double a_now)  // caller holds g_camLock
-	{
-		if (g_camSel >= 0) return g_cams[g_camSel].p ? g_camSel : -1;
-		int best = -1;
-		for (int i = 0; i < kCams; ++i) {
-			if (g_cams[i].p && a_now - g_cams[i].t < 0.25 && (best < 0 || g_cams[i].n > g_cams[best].n)) best = i;
-		}
-		return best;
+		uintptr_t v = 0;
+		double    proj[16];
+		if (!g_renderView || !Read(reinterpret_cast<uintptr_t>(g_renderView), v) || !SafeRead(a_m12, v + 0x70, 96) ||
+			!SafeRead(proj, v + 0xD0, sizeof(proj)) || proj[5] == 0.0)
+			return false;
+		a_fovY = static_cast<float>(2.0 * std::atan(1.0 / std::fabs(proj[5])));
+		return true;
 	}
 
 	// ---- focus / pause (Phase 1: Control must keep playing while Resonant is in front) ----------
@@ -196,14 +154,7 @@ namespace
 			a_r.flags |= kRowPlayer;
 		}
 		ReleaseSRWLockShared(&g_avLock);
-		AcquireSRWLockShared(&g_camLock);
-		int s = SelectedCam(a_r.t);
-		if (s >= 0) {
-			memcpy(a_r.cam, g_cams[s].m, sizeof(a_r.cam));
-			a_r.fov = g_cams[s].fov;
-			a_r.flags |= kRowCam;
-		}
-		ReleaseSRWLockShared(&g_camLock);
+		if (ReadCamera(a_r.cam, a_r.fov)) a_r.flags |= kRowCam;
 	}
 
 	void LogAvatars()
@@ -223,39 +174,32 @@ namespace
 		ReleaseSRWLockShared(&g_avLock);
 	}
 
-	void LogCams()
+	void LogCamera()
 	{
-		double now = Now();
-		AcquireSRWLockExclusive(&g_camLock);
-		int sel = SelectedCam(now);
-		for (int i = 0; i < kCams; ++i) {
-			Cam& c = g_cams[i];
-			if (!c.p) continue;
-			Log("  cam %2d%s %p ('%s') %llu updates (+%llu), %.2f s ago, fov %.4g, pos? [%.3f %.3f %.3f] / [%.3f %.3f %.3f]", i, i == sel ? "*" : " ",
-				c.p, ClassOf(reinterpret_cast<uintptr_t>(c.p)).c_str(), static_cast<unsigned long long>(c.n),
-				static_cast<unsigned long long>(c.n - c.nMark), now - c.t, c.fov, c.m[9], c.m[10], c.m[11], c.m[3], c.m[7], c.m[11]);
-			c.nMark = c.n;
+		double m[12];
+		float  fov = 0;
+		uintptr_t v = 0;
+		if (g_renderView) Read(reinterpret_cast<uintptr_t>(g_renderView), v);
+		if (!ReadCamera(m, fov)) {
+			Log("camera: g_pRenderView %p -> %p, unreadable", static_cast<const void*>(g_renderView), reinterpret_cast<void*>(v));
+			return;
 		}
-		ReleaseSRWLockExclusive(&g_camLock);
+		Log("camera (g_pRenderView -> %p): pos %.3f %.3f %.3f  fwd %.3f %.3f %.3f  up %.3f %.3f %.3f  fovY %.1f deg", reinterpret_cast<void*>(v),
+			m[9], m[10], m[11], m[6], m[7], m[8], m[3], m[4], m[5], fov * 57.29578f);
 	}
 
 	void Summary()
 	{
 		LogAvatars();
-		LogCams();
+		LogCamera();
 	}
 
 	bool Command(int argc, char** argv)
 	{
 		if (!_stricmp(argv[0], "avatar")) {
 			LogAvatars();
-		} else if (!_stricmp(argv[0], "cams")) {
-			LogCams();
-		} else if (!_stricmp(argv[0], "cam") && argc > 1) {
-			AcquireSRWLockExclusive(&g_camLock);
-			g_camSel = !_stricmp(argv[1], "auto") ? -1 : std::clamp(atoi(argv[1]), 0, kCams - 1);
-			ReleaseSRWLockExclusive(&g_camLock);
-			Log("camera selection: %s", argv[1]);
+		} else if (!_stricmp(argv[0], "camera")) {
+			LogCamera();
 		} else {
 			return false;
 		}
@@ -294,8 +238,8 @@ namespace
 			reinterpret_cast<void**>(&g_getAvatarOrig[0]), "ClientPlayerController::getAvatarObject");
 		Hook(Export(core, "?getAvatarObject@ServerPlayerController@coregame@@QEAAPEAVEntityState@2@XZ"), reinterpret_cast<void*>(&GetAvatarDetour<1>),
 			reinterpret_cast<void**>(&g_getAvatarOrig[1]), "ServerPlayerController::getAvatarObject");
-		Hook(Export(core, "?updateViewFromTransform@CameraComponentState@coregame@@AEAAXXZ"), reinterpret_cast<void*>(&UpdateViewDetour),
-			reinterpret_cast<void**>(&g_updateViewOrig), "CameraComponentState::updateViewFromTransform");
+		HMODULE shared = FirstModule({ L"coreshared_rmdwin10_f.dll", L"coreshared_rmdwin7_f.dll" });
+		g_renderView = static_cast<const uintptr_t*>(Export(shared, "?g_pRenderView@coreshared@@3PEBVView@m@@EB"));
 		Hook(Export(core, "?hasFocus@GameWindow@coregame@@QEBA_NXZ"), reinterpret_cast<void*>(&HasFocusDetour),
 			reinterpret_cast<void**>(&g_hasFocusOrig), "GameWindow::hasFocus");
 		Hook(Export(core, "?isMinimized@GameWindow@coregame@@QEBA_NXZ"), reinterpret_cast<void*>(&IsMinimizedDetour),
