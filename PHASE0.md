@@ -454,6 +454,14 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
   (Resonant) are hooked; every opened video is logged by name, and names matching `SkipVideos`
   substrings are refused. Every call site checks for a failed open, so playback is just skipped.
 
+## In-game test 17 (2026-10-11): Control crashed by the intro skip
+
+- Control's intro is `data_pc\textures\videos\intro\startvideos.tex`, a video *texture*
+  (BinkOpen 3.1 s after start). Refusing to open it crashed Control 11 s later: access violation in
+  d3d_rmdwin10_f.dll+0x39bb0 (renderer used the missing video texture).
+- Now the video opens normally and is sought to its last frame with `BinkGoto` (HBINK =
+  {Width, Height, Frames, FrameNum, ...}), so handles and textures stay valid.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`
