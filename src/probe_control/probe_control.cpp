@@ -14,6 +14,7 @@
 #include "../common/probe.h"
 #include "../common/bridge.h"
 #include "../common/wwise.h"
+#include "vpad.h"
 
 using namespace cb;
 
@@ -27,6 +28,7 @@ namespace
 	{
 		void*    ctrl;
 		void*    ent;
+		uintptr_t entVt;  // the entity's vtable when the game last handed it out (liveness check)
 		uint64_t calls, callsMark, xfCalls;
 		uint32_t tid;
 		double   t;  // last transform
@@ -63,6 +65,7 @@ namespace
 		a.tid = GetCurrentThreadId();
 		want = g_getTransform && (a_ent != a.ent || now - a.t > 0.002);  // at most ~500 transforms/s
 		a.ent = a_ent;
+		a.entVt = *static_cast<const uintptr_t*>(a_ent);  // the game just returned it: alive
 		ReleaseSRWLockExclusive(&g_avLock);
 		if (!want) return;
 		alignas(16) float m[32] = {};  // generous: Matrix4x3<float> is 48 or 64 bytes
@@ -75,6 +78,36 @@ namespace
 		a.t = now;
 		++a.xfCalls;
 		ReleaseSRWLockExclusive(&g_avLock);
+	}
+
+	// Test 5: Control only calls getAvatarObject while it has focus, so with Resonant in front Jesse's
+	// transform went stale. The frame thread (RenderAudio, Control's main thread) also samples it from
+	// the cached entity, as long as the entity still carries the vtable it had when the game handed it
+	// out.
+	void SampleOnFrameThread()
+	{
+		double now = Now();
+		for (int k = 0; k < 2; ++k) {
+			AcquireSRWLockShared(&g_avLock);
+			void*     ent = g_av[k].ent;
+			uintptr_t vt = g_av[k].entVt;
+			bool      due = ent && g_getTransform && now - g_av[k].t > 0.004;
+			ReleaseSRWLockShared(&g_avLock);
+			uintptr_t cur = 0;
+			if (!due || !Read(reinterpret_cast<uintptr_t>(ent), cur) || cur != vt) continue;
+			alignas(16) float m[32] = {};
+			t_inAvatar = true;
+			bool ok = CallGetTransform(ent, m);
+			t_inAvatar = false;
+			AcquireSRWLockExclusive(&g_avLock);
+			if (g_av[k].ent == ent) {
+				if (ok) memcpy(g_av[k].m, m, sizeof(g_av[k].m));
+				g_av[k].ok = ok;
+				g_av[k].t = now;
+				++g_av[k].xfCalls;
+			}
+			ReleaseSRWLockExclusive(&g_avLock);
+		}
 	}
 
 	template <int K>
@@ -119,18 +152,20 @@ namespace
 		if (prev != (a_v ? 1 : 0)) Log("focus: %s %d -> %d (obj %p, thread %lu)", a_what, prev, a_v ? 1 : 0, a_obj, GetCurrentThreadId());
 	}
 
+	// The logged values are the real ones; while the virtual pad drives Jesse (vpad.h) the game is told
+	// it has focus and isn't minimized.
 	bool HasFocusDetour(const void* a_win)
 	{
 		bool v = g_hasFocusOrig(a_win);
 		NoteChange(g_lastHasFocus, v, "GameWindow::hasFocus", a_win);
-		return v;
+		return v || vpad::ForceFocus();
 	}
 
 	bool IsMinimizedDetour(const void* a_win)
 	{
 		bool v = g_isMinOrig(a_win);
 		NoteChange(g_lastIsMin, v, "GameWindow::isMinimized", a_win);
-		return v;
+		return v && !vpad::ForceFocus();
 	}
 
 	void InputFocusDetour(void* a_mgr, bool a_v)
@@ -148,6 +183,7 @@ namespace
 	// ---- probe glue ------------------------------------------------------------------------------
 	void Fill(Row& a_r)
 	{
+		if (GetCurrentThreadId() == wwise::g_renderTid.load()) SampleOnFrameThread();
 		AcquireSRWLockShared(&g_avLock);
 		const Avatar& a = (g_av[0].ok && a_r.t - g_av[0].t < 0.5) ? g_av[0] : g_av[1];
 		if (a.ok && a_r.t - a.t < 0.5) {
@@ -194,6 +230,7 @@ namespace
 		LogAvatars();
 		LogCamera();
 		bridge::Summary();
+		vpad::Summary();
 	}
 
 	// Phase 1 (passive): Jesse and the camera go to the link every frame.
@@ -276,6 +313,11 @@ namespace
 		wwise::views::g_mod = rl;  // m::PerspectiveView lives in rl_*.dll
 
 		bridge::Open(false);
+		vpad::Init();
+		g_game.workerTick = [] {
+			wwise::autorecon::Tick();
+			vpad::Tick();
+		};
 		g_game.publish = Publish;
 		g_game.fill = Fill;
 		g_game.summary = Summary;

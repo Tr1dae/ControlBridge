@@ -3,8 +3,9 @@
 // member: hitReport+0x38. A second copy (previous step) follows at +0x58 after the first.
 //
 // The ControllerHitReport vtable is found by RTTI name, its instances by heap scan (a fraction of a
-// second); the player's is the one nearest the player's Wwise emitters. Re-searched when the
+// second). Re-searched when the
 // tracked object dies (vtable changes) or every 10 s while untracked. Read-only.
+// Selection: nearest to the Wwise listener (see Search).
 #pragma once
 
 #include "../common/probe.h"
@@ -26,30 +27,28 @@ namespace cb::player
 		return a_obj && Read(a_obj, vt) && vt == g_vt && SafeRead(a_out, a_obj + kPosOff, 24) && std::isfinite(a_out[0]);
 	}
 
-	// Picks the controller nearest the player's emitters (nearest non-camera emitter to the listener).
+	// Picks the controller nearest the Wwise listener: in Resonant the listener sits between the camera
+	// and Dylan (test 4: 1.5 m from the camera), so Dylan's controller is the closest one. (Test 5: the
+	// nearest-emitter rule found none of the 62 controllers within 3 m.)
 	inline void Search()
 	{
 		using namespace wwise;
 		Xf lis;
 		if (!g_vt || !Get(ListenerId(), lis)) return;
-		auto near_ = Nearest(lis.pos, 1, 0.5);
-		if (near_.empty()) return;
-		const double* ref = near_[0].xf.pos;
-		auto          inst = ScanHeap(g_vt, 512);
+		auto inst = ScanHeap(g_vt, 512);
 		g_instances = inst.size();
-		uintptr_t best = 0;
-		double    bestD = 3.0;  // horizontal metres
+		std::vector<std::pair<double, uintptr_t>> by;
 		for (uintptr_t p : inst) {
 			double pos[3];
-			if (!Pos(p, pos)) continue;
-			double dx = pos[0] - ref[0], dz = pos[2] - ref[2];
-			double d = std::sqrt(dx * dx + dz * dz);
-			if (d < bestD) bestD = d, best = p;
+			if (Pos(p, pos)) by.push_back({ Dist(pos, lis.pos), p });
 		}
-		if (best != g_obj.load()) {
-			Log("player: %zu character controllers; tracking %p (%.2f m from emitter %llu)", inst.size(), reinterpret_cast<void*>(best), bestD,
-				static_cast<unsigned long long>(near_[0].id));
-		}
+		std::sort(by.begin(), by.end());
+		char line[256];
+		int  n = snprintf(line, sizeof(line), "player: %zu controllers, nearest to the listener:", inst.size());
+		for (size_t i = 0; i < by.size() && i < 3; ++i) n += snprintf(line + n, sizeof(line) - n, " %p %.2f m", reinterpret_cast<void*>(by[i].second), by[i].first);
+		Log("%s", line);
+		uintptr_t best = !by.empty() && by[0].first < 10.0 ? by[0].second : 0;
+		if (best != g_obj.load()) Log("player: tracking %p", reinterpret_cast<void*>(best));
 		g_obj = best;
 	}
 

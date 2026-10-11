@@ -537,37 +537,50 @@ namespace cb::wwise
 		inline bool   g_on = false, g_done = false, g_find = false;  // g_find: also run autofind (AutoFind=1)
 		inline double g_firstSeen = 0, g_still = 0, g_last[3] = {};
 
+		inline std::atomic<bool> g_running{ false };
+		inline double            g_nextViews = 0;
+
+		inline void Launch()
+		{
+			if (g_running.exchange(true)) return;
+			CreateThread(nullptr, 0, [](void*) -> DWORD {
+				// The player snapshot first (it must finish before the player moves; its chime says
+				// "walk now"), then the camera views, which don't mind movement.
+				Xf   l;
+				auto n = Get(ListenerId(), l) ? Nearest(l.pos, 1, 0.5) : std::vector<Near>{};
+				if (g_find && !n.empty()) autofind::Start(n[0].id, 1.0, 2.5);
+				views::Find(1024);
+				g_running = false;
+				return 0;
+			}, nullptr, 0, nullptr);
+		}
+
+		// Scans run on their own thread so the probe keeps logging and writing the CSV meanwhile.
 		inline void Tick()
 		{
 			autofind::Tick();
-			if (!g_on || g_done) return;
+			if (!g_on) return;
 			Xf lis;
 			if (!Get(ListenerId(), lis)) return;
 			double now = Now();
 			if (!g_firstSeen) g_firstSeen = now;
-			if (Dist(lis.pos, g_last) > 0.05) {
-				memcpy(g_last, lis.pos, 24);
-				g_still = now;
+			if (g_done) {  // the tracked view died (level change, cutscene): look again every 5 s
+				if (!views::g_view.load() && !g_running && now >= g_nextViews) {
+					g_nextViews = now + 5.0;
+					Log("auto recon: camera view lost, searching again");
+					Launch();
+				}
 				return;
 			}
-			if (now - g_firstSeen < 10.0 || now - g_still < 3.0) return;
+			if (Dist(lis.pos, g_last) > 0.25) {  // idle camera sway is a few cm (test 5 never settled at 5 cm)
+				memcpy(g_last, lis.pos, 24);
+				g_still = now;
+			}
+			bool still = now - g_firstSeen >= 10.0 && now - g_still >= 3.0;
+			if (!still && now - g_firstSeen < 30.0) return;
 			g_done = true;
-			// Scans run on their own thread so the probe keeps logging and writing the CSV meanwhile.
-			CreateThread(nullptr, 0, [](void*) -> DWORD {
-				// The player snapshot first (it must finish before the player moves; its chime says
-				// "walk now"), then the camera views, which don't mind movement.
-				Log("auto recon: player standing still%s", g_find ? ", snapshotting positions near the player" : "");
-				Xf   l;
-				auto n = Get(ListenerId(), l) ? Nearest(l.pos, 1, 0.5) : std::vector<Near>{};
-				if (!g_find) {
-				} else if (n.empty()) {
-					Log("auto recon: no emitter near the camera, autofind skipped");
-				} else {
-					autofind::Start(n[0].id, 1.0, 2.5);
-				}
-				views::Find(1024);
-				return 0;
-			}, nullptr, 0, nullptr);
+			Log("auto recon: %s%s", still ? "camera still" : "30 s in world", g_find ? ", snapshotting positions near the player" : ", searching camera views");
+			Launch();
 		}
 	}
 

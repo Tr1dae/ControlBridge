@@ -655,12 +655,19 @@ namespace cb
 		int16_t  lx, ly, rx, ry;
 	};
 
+	// The sampler's XInputGetState. A probe that hooks XInput itself (Control's virtual pad) points this
+	// at its trampoline, so the sampler keeps reporting the real controller.
+	using XGetFn = DWORD(WINAPI*)(DWORD, XState*);
+	inline std::atomic<XGetFn> g_xget{ nullptr };
+
 	inline DWORD WINAPI PadThread(void*)
 	{
 		wchar_t sys[MAX_PATH];
 		GetSystemDirectoryW(sys, MAX_PATH);
 		HMODULE x = LoadLibraryW((std::wstring(sys) + L"\\xinput1_4.dll").c_str());
-		auto    get = x ? reinterpret_cast<DWORD(WINAPI*)(DWORD, XState*)>(GetProcAddress(x, "XInputGetState")) : nullptr;
+		XGetFn  expected = nullptr;
+		if (x) g_xget.compare_exchange_strong(expected, reinterpret_cast<XGetFn>(GetProcAddress(x, "XInputGetState")));
+		bool    get = g_xget.load() != nullptr;
 		Log("pad sampler: system xinput1_4 %s", get ? "ready" : "MISSING (keyboard only)");
 		int       index = -1;
 		ULONGLONG nextProbe = 0;
@@ -669,11 +676,11 @@ namespace cb
 			PadSnap s;
 			if (get) {
 				XState st{};
-				if (index >= 0 && get(index, &st) != ERROR_SUCCESS) index = -1;
+				if (index >= 0 && g_xget.load()(index, &st) != ERROR_SUCCESS) index = -1;
 				if (index < 0 && GetTickCount64() >= nextProbe) {  // polling absent pads is slow: once a second
 					nextProbe = GetTickCount64() + 1000;
 					for (int i = 0; i < 4 && index < 0; ++i) {
-						if (get(i, &st) == ERROR_SUCCESS) index = i;
+						if (g_xget.load()(i, &st) == ERROR_SUCCESS) index = i;
 					}
 				}
 				if (index >= 0) {

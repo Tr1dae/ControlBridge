@@ -91,6 +91,48 @@ namespace
 		CHECK(reads > 1000 && torn == 0 && backwards == 0);
 	}
 
+	// Test 5: two threads published at once (Resonant moved its audio thread) and left the counter
+	// odd for good. Now: forced parity heals it, and TryWrite serializes publishers.
+	void TestTwoWriters()
+	{
+		std::wstring name = TestName(L"two");
+		Mapping      m;
+		m.Open(name.c_str());
+		GuestState g{}, out{};
+		g.frame = 7;
+		for (double& p : g.jesse.pos) p = 7.0;  // consistent, so reads before the writers start aren't 'torn'
+		m.shm->guest.seq = 13;  // stuck odd, as after the overlap
+		CHECK(!Read(m.shm->guest, out));
+		Write(m.shm->guest, g);
+		CHECK(Read(m.shm->guest, out) && out.frame == 7 && (m.shm->guest.seq & 1) == 0);
+
+		std::atomic_flag  busy = ATOMIC_FLAG_INIT;
+		std::atomic<bool> stop{ false };
+		std::atomic<uint64_t> skipped{ 0 };
+		auto writer = [&](uint64_t a_base) {
+			GuestState w{};
+			for (uint64_t i = 1; !stop; ++i) {
+				w.frame = a_base + i;
+				for (double& p : w.jesse.pos) p = static_cast<double>(w.frame);
+				if (!TryWrite(m.shm->guest, w, busy)) ++skipped;
+			}
+		};
+		std::thread a(writer, 0), b(writer, 1ull << 40);
+		uint64_t reads = 0, torn = 0;
+		ULONGLONG until = GetTickCount64() + 1000;
+		while (GetTickCount64() < until) {
+			if (!Read(m.shm->guest, out)) continue;
+			++reads;
+			torn += out.jesse.pos[0] != static_cast<double>(out.frame) || out.jesse.pos[2] != static_cast<double>(out.frame);
+		}
+		stop = true;
+		a.join();
+		b.join();
+		printf("two writers: %llu reads, %llu torn, %llu writes skipped, final seq %u\n", reads, torn,
+			static_cast<unsigned long long>(skipped.load()), m.shm->guest.seq);
+		CHECK(reads > 1000 && torn == 0 && (m.shm->guest.seq & 1) == 0 && Read(m.shm->guest, out));
+	}
+
 	void TestRing()
 	{
 		std::wstring name = TestName(L"ring");
@@ -208,6 +250,7 @@ int main(int argc, char** argv)
 	}
 	TestMapping();
 	TestSeqlock();
+	TestTwoWriters();
 	TestRing();
 	printf(g_fail ? "LINK TEST FAILED (%d)\n" : "LINK TEST OK\n", g_fail);
 	return g_fail ? 1 : 0;

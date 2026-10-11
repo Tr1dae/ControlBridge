@@ -36,6 +36,10 @@ if not exist obj\linktest mkdir obj\linktest
 if exist bin\link_test.exe del bin\link_test.exe
 %RUN% cl %CXX% tests\link_test.cpp /Foobj\linktest\ /Fdobj\linktest\ /Febin\link_test.exe /link /DEBUG
 if not exist bin\link_test.exe goto fail
+if not exist obj\vpadtest mkdir obj\vpadtest
+if exist bin\vpad_test.exe del bin\vpad_test.exe
+%RUN% cl %CXX% tests\vpad_test.cpp %MH% /Foobj\vpadtest\ /Fdobj\vpadtest\ /Febin\vpad_test.exe /link /DEBUG psapi.lib user32.lib
+if not exist bin\vpad_test.exe goto fail
 echo BUILD OK
 exit /b 0
 :fail

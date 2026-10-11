@@ -247,6 +247,39 @@ Both probes open `Local\ControlBridge_v1` and publish every frame:
 `tools/cb_monitor.py` shows both sides live, plus the Dylan - Jesse offset. It uses
 `bin/link_test.exe --layout` for offsets and is tested with `link_test --fake`. Nothing is driven yet.
 
+## In-game test 5 (2026-10-11): both games at once, passive link
+
+- Both games ran together without crashes. Frame rate was fine: Resonant 120 to 170/s, Control
+  70 to 90/s in the background. Your controller reached the link (`PadState` active).
+- **Link bug:** at about 10:57:26 Resonant moved RenderAudio to another thread, and two threads
+  published at once. The seqlock writer derived its counter from the old value, so one overlap left
+  it odd for good and every reader gave up. Fixed: writers are serialized (`TryWrite` / a busy flag,
+  skip on contention), and the writer forces parity, so a stuck counter heals on the next write.
+  `link_test` covers it (two writers, stuck-odd start).
+- **Jesse stayed 0:** Control only calls `getAvatarObject` while it has focus, so the cached transform
+  went stale behind Resonant. Now the frame thread samples `getTransform` from the cached entity, after
+  checking its vtable is unchanged.
+- **Dylan not tracked:** 62 controllers, none within 3 m of the emitter chosen as reference. The
+  selection is now the controller nearest the Wwise listener (within 10 m), logging the three
+  nearest.
+- **Resonant camera not searched:** the "camera still" trigger (5 cm) never fired. It is now 25 cm,
+  with a 30 s fallback and a re-search whenever the tracked view dies.
+- After alt-tabbing back into Control, your controller stopped working there; keyboard was fine,
+  and Resonant always kept the controller. Likely Steam Input routing the pad to the focused Steam
+  game. Control's input will come from the virtual pad (next).
+
+## Phase 1: virtual pad + fake focus (built 2026-10-11)
+
+- `src/probe_control/vpad.h`: hooks `XInputGetState` in Control's xinput module (`xinput1_4` /
+  `1_3` / `9_1_0`). While the host is alive and its pad active, index 0 returns Resonant's controller;
+  otherwise every call passes through. The probe's own pad sampler is routed to the trampoline.
+- Fake focus: `GameWindow::hasFocus` returns true, and `isMinimized` false, while the host's pad drives
+  Jesse. The log still records the real values.
+- Switched by `VirtualPad=1` and `FakeFocus=1` in Control's `controlbridge.ini`.
+- `tests/vpad_test.cpp` checks this against the real system xinput1_4 and a private mapping: served
+  while the host is alive with an active pad; passed through when inactive, when the host is gone, or
+  when switched off.
+
 ### Still open (Phase 0b)
 
 - Resonant player transform in the ECS (not just an emitter): find the `coregame::component::Player`

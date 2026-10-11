@@ -74,15 +74,29 @@ namespace cb::link
 	}
 
 	// ---- seqlock -----------------------------------------------------------------------------------
+	// One writer at a time (see TryWrite). The parity is forced rather than derived (odd while
+	// writing, even after), so a counter left odd by an overlapping write (test 5: Resonant moved its
+	// audio thread and two threads published at once) heals on the next write instead of staying odd.
 	template <class T>
 	inline void Write(Slot<T>& a_slot, const T& a_value)
 	{
-		uint32_t s = a_slot.seq;
-		a_slot.seq = s + 1;  // odd: writing
+		uint32_t s = (a_slot.seq + 1) | 1;  // odd: writing
+		a_slot.seq = s;
 		Barrier();
 		memcpy(const_cast<T*>(&a_slot.data), &a_value, sizeof(T));
 		Barrier();
-		a_slot.seq = s + 2;
+		a_slot.seq = s + 1;
+	}
+
+	// Write unless another thread of this process is writing the same kind of slot right now (then
+	// skip: the next frame publishes again).
+	template <class T>
+	inline bool TryWrite(Slot<T>& a_slot, const T& a_value, std::atomic_flag& a_busy)
+	{
+		if (a_busy.test_and_set(std::memory_order_acquire)) return false;
+		Write(a_slot, a_value);
+		a_busy.clear(std::memory_order_release);
+		return true;
 	}
 
 	// Returns false if no consistent copy was obtained (writer kept interrupting) or nothing was
