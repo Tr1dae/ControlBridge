@@ -23,6 +23,8 @@ set MH=obj\minhook\buffer.obj obj\minhook\hook.obj obj\minhook\trampoline.obj ob
 %RUN% cl %CXX% /LD src\probe_control\probe_control.cpp %MH% /Foobj\control\ /Fdobj\control\ /Febin\control\winmm.dll /link /DEBUG /OPT:REF psapi.lib user32.lib || goto fail
 %RUN% cl %CXX% /LD src\probe_resonant\probe_resonant.cpp %MH% /Foobj\resonant\ /Fdobj\resonant\ /Febin\resonant\cb_probe_resonant.dll /link /DEBUG /OPT:REF psapi.lib user32.lib || goto fail
 %RUN% cl %CXX% tests\selftest.cpp %MH% /Foobj\selftest\ /Fdobj\selftest\ /Febin\selftest.exe /link /DEBUG psapi.lib user32.lib || goto fail
+if not exist obj\linktest mkdir obj\linktest
+%RUN% cl %CXX% tests\link_test.cpp /Foobj\linktest\ /Fdobj\linktest\ /Febin\link_test.exe /link /DEBUG || goto fail
 echo BUILD OK
 exit /b 0
 :fail
