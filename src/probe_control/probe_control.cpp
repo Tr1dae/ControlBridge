@@ -142,6 +142,50 @@ namespace
 		return best;
 	}
 
+	// ---- focus / pause (Phase 1: Control must keep playing while Resonant is in front) ----------
+	// GameWindow::hasFocus = byte +0x7C, isMinimized = +0x7D (both imported by the exe);
+	// InputManager::setFocus(bool) stores +0x39; GameHelper::setGamePaused(bool) is static.
+	// Detours log every change of value; they never alter one.
+	using GetBoolFn = bool (*)(const void*);
+	using SetBoolFn = void (*)(void*, bool);
+	using SetPausedFn = void (*)(bool);
+	GetBoolFn   g_hasFocusOrig = nullptr, g_isMinOrig = nullptr;
+	SetBoolFn   g_inputFocusOrig = nullptr;
+	SetPausedFn g_setPausedOrig = nullptr;
+	std::atomic<int> g_lastHasFocus{ -1 }, g_lastIsMin{ -1 }, g_lastInputFocus{ -1 };
+
+	void NoteChange(std::atomic<int>& a_last, bool a_v, const char* a_what, const void* a_obj)
+	{
+		int prev = a_last.exchange(a_v ? 1 : 0);
+		if (prev != (a_v ? 1 : 0)) Log("focus: %s %d -> %d (obj %p, thread %lu)", a_what, prev, a_v ? 1 : 0, a_obj, GetCurrentThreadId());
+	}
+
+	bool HasFocusDetour(const void* a_win)
+	{
+		bool v = g_hasFocusOrig(a_win);
+		NoteChange(g_lastHasFocus, v, "GameWindow::hasFocus", a_win);
+		return v;
+	}
+
+	bool IsMinimizedDetour(const void* a_win)
+	{
+		bool v = g_isMinOrig(a_win);
+		NoteChange(g_lastIsMin, v, "GameWindow::isMinimized", a_win);
+		return v;
+	}
+
+	void InputFocusDetour(void* a_mgr, bool a_v)
+	{
+		NoteChange(g_lastInputFocus, a_v, "InputManager::setFocus", a_mgr);
+		g_inputFocusOrig(a_mgr, a_v);
+	}
+
+	void SetPausedDetour(bool a_v)
+	{
+		Log("pause: GameHelper::setGamePaused(%d) (thread %lu)", a_v, GetCurrentThreadId());
+		g_setPausedOrig(a_v);
+	}
+
 	// ---- probe glue ------------------------------------------------------------------------------
 	void Fill(Row& a_r)
 	{
@@ -252,6 +296,15 @@ namespace
 			reinterpret_cast<void**>(&g_getAvatarOrig[1]), "ServerPlayerController::getAvatarObject");
 		Hook(Export(core, "?updateViewFromTransform@CameraComponentState@coregame@@AEAAXXZ"), reinterpret_cast<void*>(&UpdateViewDetour),
 			reinterpret_cast<void**>(&g_updateViewOrig), "CameraComponentState::updateViewFromTransform");
+		Hook(Export(core, "?hasFocus@GameWindow@coregame@@QEBA_NXZ"), reinterpret_cast<void*>(&HasFocusDetour),
+			reinterpret_cast<void**>(&g_hasFocusOrig), "GameWindow::hasFocus");
+		Hook(Export(core, "?isMinimized@GameWindow@coregame@@QEBA_NXZ"), reinterpret_cast<void*>(&IsMinimizedDetour),
+			reinterpret_cast<void**>(&g_isMinOrig), "GameWindow::isMinimized");
+		Hook(Export(core, "?setGamePaused@GameHelper@coregame@@SAX_N@Z"), reinterpret_cast<void*>(&SetPausedDetour),
+			reinterpret_cast<void**>(&g_setPausedOrig), "GameHelper::setGamePaused");
+		HMODULE input = FirstModule({ L"input_rmdwin10_f.dll", L"input_rmdwin7_f.dll" });
+		Hook(Export(input, "?setFocus@InputManager@input@@QEAAX_N@Z"), reinterpret_cast<void*>(&InputFocusDetour),
+			reinterpret_cast<void**>(&g_inputFocusOrig), "InputManager::setFocus");
 		if (snd) wwise::Install(snd);
 		wwise::views::g_mod = rl;  // m::PerspectiveView lives in rl_*.dll
 

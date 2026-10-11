@@ -14,14 +14,14 @@ def exports(path):
     return {s.name.decode(): s.address for s in pe.DIRECTORY_ENTRY_EXPORT.symbols if s.name}
 
 src = open("src/probe_control/probe_control.cpp", encoding="utf-8").read()
-control_names = re.findall(r'Export\(core, "([^"]+)"\)', src)
+control_names = re.findall(r'Export\((core|input), "([^"]+)"\)', src)
 ok = True
 for suffix in ("rmdwin10_f", "rmdwin7_f"):
-    core = exports(f"{sys.argv[1]}/coregame_{suffix}.dll")
-    for n in control_names:
-        found = n in core
+    mods = {"core": exports(f"{sys.argv[1]}/coregame_{suffix}.dll"), "input": exports(f"{sys.argv[1]}/input_{suffix}.dll")}
+    for mod, n in control_names:
+        found = n in mods[mod]
         ok &= found
-        print(f"control {suffix} coregame {'ok     ' if found else 'MISSING'} {n}")
+        print(f"control {suffix} {mod:5} {'ok     ' if found else 'MISSING'} {n}")
     snd = exports(f"{sys.argv[1]}/snd_{suffix}.dll")
     for p in WWISE:
         hits = sorted({(a, n) for n, a in snd.items() if n.startswith(p)})
