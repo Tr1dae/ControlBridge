@@ -1,0 +1,18 @@
+# build output
+bin/
+obj/
+*.pdb
+*.ilk
+*.obj
+*.exp
+*.lib
+
+# runtime data: logs, dumps, CSVs, save backups, install record (machine-specific, may contain game data)
+logs/
+dumps/
+backups/
+install_manifest.json
+*.bin
+*.csv
+
+__pycache__/
